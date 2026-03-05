@@ -113,25 +113,33 @@ tbody tr:hover {
 
 /* ===== Кнопки ===== */
 .btn {
-    display: inline-block;
-    padding: 0.5rem 1rem;
-    font-size: 0.875rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    padding: 0.6rem 1.2rem;
+    font-size: 0.9rem;
     font-weight: 500;
     color: white;
     background: var(--primary);
     border: none;
-    border-radius: var(--radius);
+    border-radius: 2rem;  /* более округлые */
     cursor: pointer;
     text-decoration: none;
-    transition: background-color 0.2s, transform 0.1s;
+    transition: all 0.2s ease;
     box-shadow: var(--shadow-sm);
     margin: 0.25rem;
+    border: 1px solid transparent;
 }
 
 .btn:hover {
     background: var(--primary-dark);
-    transform: translateY(-1px);
+    transform: translateY(-2px);
     box-shadow: var(--shadow-md);
+}
+
+.btn:active {
+    transform: translateY(0);
 }
 
 .btn-danger {
@@ -140,6 +148,33 @@ tbody tr:hover {
 
 .btn-danger:hover {
     background: var(--danger-dark);
+}
+
+.btn-outline {
+    background: transparent;
+    color: var(--primary);
+    border: 1px solid var(--primary);
+}
+
+.btn-outline:hover {
+    background: var(--primary);
+    color: white;
+}
+
+.btn-sm {
+    padding: 0.3rem 0.8rem;
+    font-size: 0.8rem;
+    border-radius: 1.5rem;
+}
+
+.btn-lg {
+    padding: 0.8rem 1.5rem;
+    font-size: 1rem;
+}
+
+/* Кнопка фильтра (особый случай) */
+.filter .btn {
+    margin: 0;
 }
 
 /* ===== Формы ===== */

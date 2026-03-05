@@ -2,7 +2,7 @@
 
 {% block content %}
 <h1>Мои вакансии</h1>
-<button onclick="createJob()" class="btn">Создать вакансию</button>
+<button onclick="createJob()" class="btn"><i class="fas fa-plus"></i> Создать вакансию</button>
 <table id="jobsTable">
     <thead>
         <tr>
@@ -29,10 +29,10 @@ async function loadJobs() {
             <td>${job.title}</td>
             <td>${job.threshold_score}</td>
             <td>${new Date(job.created_at).toLocaleString()}</td>
-            <td>
-                <button onclick="viewApplications('${job.id}')" class="btn">Отклики</button>
-                <button onclick="editJob('${job.id}')" class="btn">Редактировать</button>
-                <button onclick="deleteJob('${job.id}')" class="btn btn-danger">Удалить</button>
+             <td>
+                <button onclick="viewApplications('${job.id}')" class="btn btn-sm"><i class="fas fa-list"></i> Отклики</button>
+                <button onclick="editJob('${job.id}')" class="btn btn-sm"><i class="fas fa-edit"></i> Редактировать</button>
+                <button onclick="deleteJob('${job.id}')" class="btn btn-sm btn-danger"><i class="fas fa-trash"></i> Удалить</button>
             </td>
         `;
         tbody.appendChild(tr);
