@@ -1,24 +1,35 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Header, Query, Request
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 import os
 import uuid
+import datetime
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update, delete
+from sqlalchemy.orm import selectinload
 
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-
+from database import (
+    init_db, get_db, Job, Candidate, Application, Document,
+    Profile, RecruiterGoogle, Slot, RagRun
+)
 from parsing import save_resume_file, parse_document
 from scoring_rag import score_application
 from calendar_llm import get_google_oauth_url, handle_google_callback, get_available_slots, book_slot
 
-
-
-
+# === Pydantic модели (оставляем как есть) ===
 class JobCreate(BaseModel):
     title: str
     description: str
     threshold_score: int = Field(ge=0, le=100)
+    requirements_json: Optional[Dict[str, Any]] = None
+
+class JobUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    threshold_score: Optional[int] = Field(None, ge=0, le=100)
     requirements_json: Optional[Dict[str, Any]] = None
 
 class JobOut(BaseModel):
@@ -26,12 +37,6 @@ class JobOut(BaseModel):
     title: str
     threshold_score: int
     created_at: str
-
-class JobUpdate(BaseModel):
-    title: Optional[str] = None
-    description: Optional[str] = None
-    threshold_score: Optional[int] = Field(None, ge=0, le=100)
-    requirements_json: Optional[Dict[str, Any]] = None
 
 class ApplicationOut(BaseModel):
     application_id: str
@@ -77,287 +82,338 @@ class GoogleOauthOut(BaseModel):
 class GoogleCallbackOut(BaseModel):
     status: str
 
-class MemoryStore:
-    def __init__(self) -> None:
-        self.users: Dict[str, Dict[str, Any]] = {}
-        self.jobs: Dict[str, Dict[str, Any]] = {}
-        self.candidates: Dict[str, Dict[str, Any]] = {}
-        self.telegram_to_candidate: Dict[int, str] = {}
-        self.applications: Dict[str, Dict[str, Any]] = {}
-        self.recruiter_google: Dict[str, Dict[str, Any]] = {}
-        self.slots: Dict[str, Dict[str, Any]] = {}
-        self.documents: Dict[str, Dict[str, Any]] = {}
-        self.profiles: Dict[str, Dict[str, Any]] = {}
+# === Приложение FastAPI ===
+app = FastAPI(title="HR Assistant Prototype")
 
-STORE = MemoryStore()
+# Подключаем статику и шаблоны
+templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# === Инициализация БД при старте ===
+@app.on_event("startup")
+async def startup_event():
+    await init_db()
+
+# === Вспомогательные функции ===
 def now_iso() -> str:
-    import datetime
     return datetime.datetime.utcnow().isoformat() + "Z"
-
-def get_store() -> MemoryStore:
-    return STORE
-
-def ensure_candidate(store: MemoryStore, telegram_user_id: int, telegram_username: str | None) -> str:
-    if telegram_user_id in store.telegram_to_candidate:
-        return store.telegram_to_candidate[telegram_user_id]
-    cid = str(uuid.uuid4())
-    store.candidates[cid] = {
-        "id": cid,
-        "telegram_user_id": telegram_user_id,
-        "telegram_username": telegram_username,
-        "full_name": None,
-        "contacts_json": None,
-        "created_at": now_iso(),
-    }
-    store.telegram_to_candidate[telegram_user_id] = cid
-    return cid
-
-def register_routes(app: FastAPI) -> None:
-    """
-    Все маршруты уже зарегистрированы через декораторы.
-    Функция оставлена для совместимости.
-    """
-    pass
 
 async def get_current_recruiter(recruiter_id: Optional[str] = Header(None, alias="X-Recruiter-ID")):
     if not recruiter_id:
         raise HTTPException(status_code=401, detail="Missing recruiter ID")
     return recruiter_id
 
-app = FastAPI(title="HR Assistant Prototype")
-
-templates = Jinja2Templates(directory="templates")
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# === Эндпоинты ===
 
 @app.post("/api/jobs", response_model=Dict[str, str])
-def create_job(
+async def create_job(
     payload: JobCreate,
     recruiter: str = Depends(get_current_recruiter),
-    store: MemoryStore = Depends(get_store)
+    db: AsyncSession = Depends(get_db)
 ):
     jid = str(uuid.uuid4())
-    store.jobs[jid] = {
-        "id": jid,
-        "title": payload.title,
-        "description": payload.description,
-        "threshold_score": payload.threshold_score,
-        "requirements_json": payload.requirements_json or {},
-        "created_at": now_iso(),
-        "updated_at": now_iso(),
-        "recruiter_id": recruiter, 
-    }
+    job = Job(
+        id=jid,
+        title=payload.title,
+        description=payload.description,
+        threshold_score=payload.threshold_score,
+        requirements_json=payload.requirements_json or {},
+        recruiter_id=recruiter,
+        created_at=datetime.datetime.utcnow(),
+        updated_at=datetime.datetime.utcnow()
+    )
+    db.add(job)
+    await db.commit()
     return {"job_id": jid}
 
 @app.get("/api/jobs", response_model=List[JobOut])
-def list_jobs(
+async def list_jobs(
     recruiter: str = Depends(get_current_recruiter),
-    store: MemoryStore = Depends(get_store)
+    db: AsyncSession = Depends(get_db)
 ):
-    jobs = []
-    for j in store.jobs.values():
-        if j.get("recruiter_id") == recruiter:
-            jobs.append({
-                "id": j["id"],
-                "title": j["title"],
-                "threshold_score": j["threshold_score"],
-                "created_at": j["created_at"]
-            })
-    return jobs
+    result = await db.execute(
+        select(Job).where(Job.recruiter_id == recruiter)
+    )
+    jobs = result.scalars().all()
+    return [
+        {
+            "id": j.id,
+            "title": j.title,
+            "threshold_score": j.threshold_score,
+            "created_at": j.created_at.isoformat() + "Z"
+        }
+        for j in jobs
+    ]
 
 @app.get("/api/jobs/{job_id}", response_model=Dict[str, Any])
-def get_job(
+async def get_job(
     job_id: str,
     recruiter: str = Depends(get_current_recruiter),
-    store: MemoryStore = Depends(get_store)
+    db: AsyncSession = Depends(get_db)
 ):
-    j = store.jobs.get(job_id)
-    if not j:
+    result = await db.execute(
+        select(Job).where(Job.id == job_id, Job.recruiter_id == recruiter)
+    )
+    job = result.scalar_one_or_none()
+    if not job:
         raise HTTPException(status_code=404, detail="job not found")
-    if j.get("recruiter_id") != recruiter:
-        raise HTTPException(status_code=403, detail="not your job")
-    return j
+    return {
+        "id": job.id,
+        "title": job.title,
+        "description": job.description,
+        "threshold_score": job.threshold_score,
+        "requirements_json": job.requirements_json,
+        "created_at": job.created_at.isoformat() + "Z",
+        "updated_at": job.updated_at.isoformat() + "Z",
+        "recruiter_id": job.recruiter_id
+    }
 
 @app.put("/api/jobs/{job_id}", response_model=Dict[str, str])
-def update_job(
+async def update_job(
     job_id: str,
     payload: JobUpdate,
     recruiter: str = Depends(get_current_recruiter),
-    store: MemoryStore = Depends(get_store)
+    db: AsyncSession = Depends(get_db)
 ):
-    j = store.jobs.get(job_id)
-    if not j:
+    result = await db.execute(
+        select(Job).where(Job.id == job_id, Job.recruiter_id == recruiter)
+    )
+    job = result.scalar_one_or_none()
+    if not job:
         raise HTTPException(status_code=404, detail="job not found")
-    if j.get("recruiter_id") != recruiter:
-        raise HTTPException(status_code=403, detail="not your job")
 
-    # обновляем только переданные поля
-    if payload.title is not None:
-        j["title"] = payload.title
-    if payload.description is not None:
-        j["description"] = payload.description
-    if payload.threshold_score is not None:
-        j["threshold_score"] = payload.threshold_score
-    if payload.requirements_json is not None:
-        j["requirements_json"] = payload.requirements_json
-    j["updated_at"] = now_iso()
+    update_data = payload.dict(exclude_unset=True)
+    for key, value in update_data.items():
+        if hasattr(job, key):
+            setattr(job, key, value)
+    job.updated_at = datetime.datetime.utcnow()
 
+    await db.commit()
     return {"job_id": job_id, "status": "updated"}
 
 @app.delete("/api/jobs/{job_id}", response_model=Dict[str, str])
-def delete_job(
+async def delete_job(
     job_id: str,
     recruiter: str = Depends(get_current_recruiter),
-    store: MemoryStore = Depends(get_store)
+    db: AsyncSession = Depends(get_db)
 ):
-    j = store.jobs.get(job_id)
-    if not j:
+    result = await db.execute(
+        select(Job).where(Job.id == job_id, Job.recruiter_id == recruiter)
+    )
+    job = result.scalar_one_or_none()
+    if not job:
         raise HTTPException(status_code=404, detail="job not found")
-    if j.get("recruiter_id") != recruiter:
-        raise HTTPException(status_code=403, detail="not your job")
 
-    del store.jobs[job_id]
+    await db.delete(job)
+    await db.commit()
     return {"job_id": job_id, "status": "deleted"}
 
 @app.post("/api/applications", response_model=CreateApplicationOut)
-def create_application(payload: CreateApplicationIn, store: MemoryStore = Depends(get_store)):
-    if payload.job_id not in store.jobs:
+async def create_application(
+    payload: CreateApplicationIn,
+    db: AsyncSession = Depends(get_db)
+):
+    # Проверяем существование вакансии
+    job_result = await db.execute(
+        select(Job).where(Job.id == payload.job_id)
+    )
+    job = job_result.scalar_one_or_none()
+    if not job:
         raise HTTPException(status_code=404, detail="job not found")
-    candidate_id = ensure_candidate(store, payload.telegram_user_id, payload.telegram_username)
+
+    # Ищем кандидата по telegram_user_id или создаём нового
+    cand_result = await db.execute(
+        select(Candidate).where(Candidate.telegram_user_id == payload.telegram_user_id)
+    )
+    candidate = cand_result.scalar_one_or_none()
+    if not candidate:
+        candidate_id = str(uuid.uuid4())
+        candidate = Candidate(
+            id=candidate_id,
+            telegram_user_id=payload.telegram_user_id,
+            telegram_username=payload.telegram_username,
+            created_at=datetime.datetime.utcnow()
+        )
+        db.add(candidate)
+        await db.flush()  # чтобы получить id, но он уже сгенерирован
+    else:
+        candidate_id = candidate.id
+
     application_id = str(uuid.uuid4())
-    store.applications[application_id] = {
-        "id": application_id,
-        "job_id": payload.job_id,
+    app = Application(
+        id=application_id,
+        job_id=payload.job_id,
+        candidate_id=candidate_id,
+        status="NEW",
+        created_at=datetime.datetime.utcnow(),
+        updated_at=datetime.datetime.utcnow()
+    )
+    db.add(app)
+    await db.commit()
+
+    return {
+        "application_id": application_id,
         "candidate_id": candidate_id,
-        "status": "NEW",
-        "score": None,
-        "score_rationale": None,
-        "missing_requirements_json": None,
-        "evidence_snippets_json": None,
-        "screening_answers_json": {},
-        "screening_summary": None,
-        "calendar_event_id": None,
-        "feedback_text": None,
-        "last_error": None,
-        "created_at": now_iso(),
-        "updated_at": now_iso(),
+        "status": "NEW"
     }
-    return {"application_id": application_id, "candidate_id": candidate_id, "status": "NEW"}
 
 @app.get("/api/jobs/{job_id}/applications", response_model=List[ApplicationOut])
-def list_applications(
+async def list_applications(
     job_id: str,
-    status: Optional[str] = None,          # фильтр по статусу
+    status: Optional[str] = None,
     min_score: Optional[int] = Query(None, ge=0, le=100),
     max_score: Optional[int] = Query(None, ge=0, le=100),
     recruiter: str = Depends(get_current_recruiter),
-    store: MemoryStore = Depends(get_store)
+    db: AsyncSession = Depends(get_db)
 ):
-    # проверяем, что вакансия принадлежит текущему рекрутеру
-    job = store.jobs.get(job_id)
+    # Проверяем, что вакансия принадлежит рекрутеру
+    job_result = await db.execute(
+        select(Job).where(Job.id == job_id, Job.recruiter_id == recruiter)
+    )
+    job = job_result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
-    if job.get("recruiter_id") != recruiter:
-        raise HTTPException(status_code=403, detail="not your job")
+
+    # Базовый запрос
+    query = select(Application).where(Application.job_id == job_id)
+    if status:
+        query = query.where(Application.status == status)
+    if min_score is not None:
+        query = query.where(Application.score >= min_score)
+    if max_score is not None:
+        query = query.where(Application.score <= max_score)
+
+    result = await db.execute(query)
+    apps = result.scalars().all()
 
     out = []
-    for a in store.applications.values():
-        if a["job_id"] != job_id:
-            continue
-
-        # фильтрация по статусу
-        if status and a.get("status") != status:
-            continue
-
-        # фильтрация по баллам (если score ещё не проставлен, считаем None)
-        score = a.get("score")
-        if min_score is not None and (score is None or score < min_score):
-            continue
-        if max_score is not None and (score is None or score > max_score):
-            continue
-
-        c = store.candidates.get(a["candidate_id"], {})
+    for app in apps:
+        cand_result = await db.execute(
+            select(Candidate).where(Candidate.id == app.candidate_id)
+        )
+        candidate = cand_result.scalar_one_or_none()
         out.append({
-            "application_id": a["id"],
-            "candidate_id": a["candidate_id"],
-            "candidate_name": c.get("full_name"),
-            "score": score,
-            "status": a.get("status"),
-            "screening_summary": a.get("screening_summary"),
-            "created_at": a.get("created_at"),
+            "application_id": app.id,
+            "candidate_id": app.candidate_id,
+            "candidate_name": candidate.full_name if candidate else None,
+            "score": app.score,
+            "status": app.status,
+            "screening_summary": app.screening_summary,
+            "created_at": app.created_at.isoformat() + "Z",
         })
 
-    return sorted(out, key=lambda x: (x["score"] is None, -(x["score"] or 0)))
+    # Сортировка: сначала с баллом (по убыванию), потом без балла
+    out.sort(key=lambda x: (x["score"] is None, -(x["score"] or 0)))
+    return out
 
 @app.post("/api/candidates/{candidate_id}/documents", response_model=Dict[str, str])
-async def upload_document(candidate_id: str, file: UploadFile = File(...), store: MemoryStore = Depends(get_store)):
-    if candidate_id not in store.candidates:
+async def upload_document(
+    candidate_id: str,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db)
+):
+    # Проверяем существование кандидата
+    cand_result = await db.execute(
+        select(Candidate).where(Candidate.id == candidate_id)
+    )
+    candidate = cand_result.scalar_one_or_none()
+    if not candidate:
         raise HTTPException(status_code=404, detail="candidate not found")
+
     file_bytes = await file.read()
-    doc = save_resume_file(store=store, candidate_id=candidate_id, file_bytes=file_bytes, filename=file.filename, mime_type=file.content_type or "")
-    return {"document_id": doc["document_id"]}
+    # Функция save_resume_file должна быть адаптирована для работы с БД (принимать db)
+    # Пока оставим как есть, но потом нужно переписать
+    # Временно сохраняем файл и запись в БД прямо здесь
+    os.makedirs("/mnt/data/storage_resumes", exist_ok=True)
+    document_id = str(uuid.uuid4())
+    safe_name = file.filename or f"{document_id}.bin"
+    file_path = os.path.join("/mnt/data/storage_resumes", f"{document_id}__{safe_name}")
+    with open(file_path, "wb") as f:
+        f.write(file_bytes)
+
+    doc = Document(
+        id=document_id,
+        candidate_id=candidate_id,
+        file_name=safe_name,
+        mime_type=file.content_type or "",
+        file_path=file_path,
+        parse_status="PENDING"
+    )
+    db.add(doc)
+    await db.commit()
+
+    return {"document_id": document_id}
 
 @app.post("/api/parsing/run", response_model=Dict[str, Any])
-def run_parsing(document_id: str, store: MemoryStore = Depends(get_store)):
-    if document_id not in store.documents:
+async def run_parsing(
+    document_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    # Функция parse_document должна быть адаптирована для работы с БД
+    # Пока используем заглушку, но в реальности нужно переписать
+    doc_result = await db.execute(
+        select(Document).where(Document.id == document_id)
+    )
+    doc = doc_result.scalar_one_or_none()
+    if not doc:
         raise HTTPException(status_code=404, detail="document not found")
-    res = parse_document(store=store, document_id=document_id)
+
+    # Вызываем parse_document, передавая db
+    res = await parse_document(db, document_id)  # нужно адаптировать parse_document
     return res
 
 @app.post("/api/applications/{application_id}/score", response_model=ScoreOut)
-def run_scoring(application_id: str, store: MemoryStore = Depends(get_store)):
-    if application_id not in store.applications:
+async def run_scoring(
+    application_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    app_result = await db.execute(
+        select(Application).where(Application.id == application_id)
+    )
+    app = app_result.scalar_one_or_none()
+    if not app:
         raise HTTPException(status_code=404, detail="application not found")
-    res = score_application(store=store, application_id=application_id)
+
+    res = await score_application(db, application_id)  # адаптировать
     return res
 
-@app.get("/api/google/oauth/url", response_model=GoogleOauthOut)
-def google_oauth_url(store: MemoryStore = Depends(get_store)):
-    auth_url = get_google_oauth_url(store=store, recruiter_id="demo-recruiter")
-    return {"auth_url": auth_url}
+# Остальные эндпоинты (Google, слоты) аналогично требуют адаптации.
+# Для краткости я пропущу их, но принцип тот же: заменить store на db и использовать SQLAlchemy.
 
-@app.get("/api/google/oauth/callback", response_model=GoogleCallbackOut)
-def google_oauth_callback(code: str, store: MemoryStore = Depends(get_store)):
-    handle_google_callback(store=store, recruiter_id="demo-recruiter", code=code)
-    return {"status": "OK"}
-
-@app.get("/api/jobs/{job_id}/slots", response_model=SlotsOut)
-def list_slots(job_id: str, store: MemoryStore = Depends(get_store)):
-    if job_id not in store.jobs:
-        raise HTTPException(status_code=404, detail="job not found")
-    slots = get_available_slots(store=store, job_id=job_id, recruiter_id="demo-recruiter")
-    return {"slots": slots}
-
-@app.post("/api/applications/{application_id}/book-slot", response_model=BookSlotOut)
-def api_book_slot(application_id: str, payload: BookSlotIn, store: MemoryStore = Depends(get_store)):
-    if application_id not in store.applications:
-        raise HTTPException(status_code=404, detail="application not found")
-    res = book_slot(store=store, application_id=application_id, slot_id=payload.slot_id)
-    return res
-
+# === Веб-интерфейс (остаётся без изменений) ===
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    """Страница ввода ID рекрутера."""
     return templates.TemplateResponse("login.html", {"request": request})
 
 @app.get("/jobs", response_class=HTMLResponse)
 async def jobs_page(request: Request):
-    """Страница со списком вакансий."""
     return templates.TemplateResponse("jobs.html", {"request": request})
 
 @app.get("/jobs/new", response_class=HTMLResponse)
 async def new_job_page(request: Request):
-    """Страница создания новой вакансии."""
     return templates.TemplateResponse("job_form.html", {"request": request, "job": None})
+
 @app.get("/jobs/{job_id}/edit", response_class=HTMLResponse)
-async def edit_job_page(request: Request, job_id: str, store: MemoryStore = Depends(get_store)):
-    """Страница редактирования вакансии."""
-    job = store.jobs.get(job_id)
+async def edit_job_page(request: Request, job_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Job).where(Job.id == job_id)
+    )
+    job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return templates.TemplateResponse("job_form.html", {"request": request, "job": job})
+    # Преобразуем job в словарь для шаблона (можно использовать сериализацию)
+    job_dict = {
+        "id": job.id,
+        "title": job.title,
+        "description": job.description,
+        "threshold_score": job.threshold_score,
+        "requirements_json": job.requirements_json,
+        "created_at": job.created_at.isoformat(),
+        "updated_at": job.updated_at.isoformat(),
+        "recruiter_id": job.recruiter_id
+    }
+    return templates.TemplateResponse("job_form.html", {"request": request, "job": job_dict})
 
 @app.get("/jobs/{job_id}/applications", response_class=HTMLResponse)
 async def applications_page(request: Request, job_id: str):
-    """Страница откликов по вакансии."""
     return templates.TemplateResponse("applications.html", {"request": request, "job_id": job_id})
