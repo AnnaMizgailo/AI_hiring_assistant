@@ -312,7 +312,6 @@ async def upload_document(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db)
 ):
-    # Проверяем существование кандидата
     cand_result = await db.execute(
         select(Candidate).where(Candidate.id == candidate_id)
     )
@@ -321,13 +320,14 @@ async def upload_document(
         raise HTTPException(status_code=404, detail="candidate not found")
 
     file_bytes = await file.read()
-    # Функция save_resume_file должна быть адаптирована для работы с БД (принимать db)
-    # Пока оставим как есть, но потом нужно переписать
-    # Временно сохраняем файл и запись в БД прямо здесь
-    os.makedirs("/mnt/data/storage_resumes", exist_ok=True)
+
+    STORAGE_DIR = os.path.join(os.path.dirname(__file__), "storage_resumes")
+    os.makedirs(STORAGE_DIR, exist_ok=True)
+
     document_id = str(uuid.uuid4())
     safe_name = file.filename or f"{document_id}.bin"
-    file_path = os.path.join("/mnt/data/storage_resumes", f"{document_id}__{safe_name}")
+    file_path = os.path.join(STORAGE_DIR, f"{document_id}__{safe_name}")
+
     with open(file_path, "wb") as f:
         f.write(file_bytes)
 
