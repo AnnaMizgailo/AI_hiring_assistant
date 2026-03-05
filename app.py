@@ -1,12 +1,19 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Header, Query, Request
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 import os
 import uuid
 
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
 from parsing import save_resume_file, parse_document
 from scoring_rag import score_application
 from calendar_llm import get_google_oauth_url, handle_google_callback, get_available_slots, book_slot
+
+
+
 
 class JobCreate(BaseModel):
     title: str
@@ -19,6 +26,12 @@ class JobOut(BaseModel):
     title: str
     threshold_score: int
     created_at: str
+
+class JobUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    threshold_score: Optional[int] = Field(None, ge=0, le=100)
+    requirements_json: Optional[Dict[str, Any]] = None
 
 class ApplicationOut(BaseModel):
     application_id: str
@@ -100,10 +113,29 @@ def ensure_candidate(store: MemoryStore, telegram_user_id: int, telegram_usernam
     store.telegram_to_candidate[telegram_user_id] = cid
     return cid
 
+def register_routes(app: FastAPI) -> None:
+    """
+    Все маршруты уже зарегистрированы через декораторы.
+    Функция оставлена для совместимости.
+    """
+    pass
+
+async def get_current_recruiter(recruiter_id: Optional[str] = Header(None, alias="X-Recruiter-ID")):
+    if not recruiter_id:
+        raise HTTPException(status_code=401, detail="Missing recruiter ID")
+    return recruiter_id
+
 app = FastAPI(title="HR Assistant Prototype")
 
+templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 @app.post("/api/jobs", response_model=Dict[str, str])
-def create_job(payload: JobCreate, store: MemoryStore = Depends(get_store)):
+def create_job(
+    payload: JobCreate,
+    recruiter: str = Depends(get_current_recruiter),
+    store: MemoryStore = Depends(get_store)
+):
     jid = str(uuid.uuid4())
     store.jobs[jid] = {
         "id": jid,
@@ -113,23 +145,79 @@ def create_job(payload: JobCreate, store: MemoryStore = Depends(get_store)):
         "requirements_json": payload.requirements_json or {},
         "created_at": now_iso(),
         "updated_at": now_iso(),
-        "recruiter_id": "demo-recruiter",
+        "recruiter_id": recruiter, 
     }
     return {"job_id": jid}
 
 @app.get("/api/jobs", response_model=List[JobOut])
-def list_jobs(store: MemoryStore = Depends(get_store)):
-    return [
-        {"id": j["id"], "title": j["title"], "threshold_score": j["threshold_score"], "created_at": j["created_at"]}
-        for j in store.jobs.values()
-    ]
+def list_jobs(
+    recruiter: str = Depends(get_current_recruiter),
+    store: MemoryStore = Depends(get_store)
+):
+    jobs = []
+    for j in store.jobs.values():
+        if j.get("recruiter_id") == recruiter:
+            jobs.append({
+                "id": j["id"],
+                "title": j["title"],
+                "threshold_score": j["threshold_score"],
+                "created_at": j["created_at"]
+            })
+    return jobs
 
 @app.get("/api/jobs/{job_id}", response_model=Dict[str, Any])
-def get_job(job_id: str, store: MemoryStore = Depends(get_store)):
+def get_job(
+    job_id: str,
+    recruiter: str = Depends(get_current_recruiter),
+    store: MemoryStore = Depends(get_store)
+):
     j = store.jobs.get(job_id)
     if not j:
         raise HTTPException(status_code=404, detail="job not found")
+    if j.get("recruiter_id") != recruiter:
+        raise HTTPException(status_code=403, detail="not your job")
     return j
+
+@app.put("/api/jobs/{job_id}", response_model=Dict[str, str])
+def update_job(
+    job_id: str,
+    payload: JobUpdate,
+    recruiter: str = Depends(get_current_recruiter),
+    store: MemoryStore = Depends(get_store)
+):
+    j = store.jobs.get(job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="job not found")
+    if j.get("recruiter_id") != recruiter:
+        raise HTTPException(status_code=403, detail="not your job")
+
+    # обновляем только переданные поля
+    if payload.title is not None:
+        j["title"] = payload.title
+    if payload.description is not None:
+        j["description"] = payload.description
+    if payload.threshold_score is not None:
+        j["threshold_score"] = payload.threshold_score
+    if payload.requirements_json is not None:
+        j["requirements_json"] = payload.requirements_json
+    j["updated_at"] = now_iso()
+
+    return {"job_id": job_id, "status": "updated"}
+
+@app.delete("/api/jobs/{job_id}", response_model=Dict[str, str])
+def delete_job(
+    job_id: str,
+    recruiter: str = Depends(get_current_recruiter),
+    store: MemoryStore = Depends(get_store)
+):
+    j = store.jobs.get(job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="job not found")
+    if j.get("recruiter_id") != recruiter:
+        raise HTTPException(status_code=403, detail="not your job")
+
+    del store.jobs[job_id]
+    return {"job_id": job_id, "status": "deleted"}
 
 @app.post("/api/applications", response_model=CreateApplicationOut)
 def create_application(payload: CreateApplicationIn, store: MemoryStore = Depends(get_store)):
@@ -157,25 +245,48 @@ def create_application(payload: CreateApplicationIn, store: MemoryStore = Depend
     return {"application_id": application_id, "candidate_id": candidate_id, "status": "NEW"}
 
 @app.get("/api/jobs/{job_id}/applications", response_model=List[ApplicationOut])
-def list_applications(job_id: str, store: MemoryStore = Depends(get_store)):
-    if job_id not in store.jobs:
+def list_applications(
+    job_id: str,
+    status: Optional[str] = None,          # фильтр по статусу
+    min_score: Optional[int] = Query(None, ge=0, le=100),
+    max_score: Optional[int] = Query(None, ge=0, le=100),
+    recruiter: str = Depends(get_current_recruiter),
+    store: MemoryStore = Depends(get_store)
+):
+    # проверяем, что вакансия принадлежит текущему рекрутеру
+    job = store.jobs.get(job_id)
+    if not job:
         raise HTTPException(status_code=404, detail="job not found")
+    if job.get("recruiter_id") != recruiter:
+        raise HTTPException(status_code=403, detail="not your job")
+
     out = []
     for a in store.applications.values():
         if a["job_id"] != job_id:
             continue
+
+        # фильтрация по статусу
+        if status and a.get("status") != status:
+            continue
+
+        # фильтрация по баллам (если score ещё не проставлен, считаем None)
+        score = a.get("score")
+        if min_score is not None and (score is None or score < min_score):
+            continue
+        if max_score is not None and (score is None or score > max_score):
+            continue
+
         c = store.candidates.get(a["candidate_id"], {})
-        out.append(
-            {
-                "application_id": a["id"],
-                "candidate_id": a["candidate_id"],
-                "candidate_name": c.get("full_name"),
-                "score": a.get("score"),
-                "status": a.get("status"),
-                "screening_summary": a.get("screening_summary"),
-                "created_at": a.get("created_at"),
-            }
-        )
+        out.append({
+            "application_id": a["id"],
+            "candidate_id": a["candidate_id"],
+            "candidate_name": c.get("full_name"),
+            "score": score,
+            "status": a.get("status"),
+            "screening_summary": a.get("screening_summary"),
+            "created_at": a.get("created_at"),
+        })
+
     return sorted(out, key=lambda x: (x["score"] is None, -(x["score"] or 0)))
 
 @app.post("/api/candidates/{candidate_id}/documents", response_model=Dict[str, str])
@@ -223,3 +334,30 @@ def api_book_slot(application_id: str, payload: BookSlotIn, store: MemoryStore =
         raise HTTPException(status_code=404, detail="application not found")
     res = book_slot(store=store, application_id=application_id, slot_id=payload.slot_id)
     return res
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    """Страница ввода ID рекрутера."""
+    return templates.TemplateResponse("login.html", {"request": request})
+
+@app.get("/jobs", response_class=HTMLResponse)
+async def jobs_page(request: Request):
+    """Страница со списком вакансий."""
+    return templates.TemplateResponse("jobs.html", {"request": request})
+
+@app.get("/jobs/new", response_class=HTMLResponse)
+async def new_job_page(request: Request):
+    """Страница создания новой вакансии."""
+    return templates.TemplateResponse("job_form.html", {"request": request, "job": None})
+@app.get("/jobs/{job_id}/edit", response_class=HTMLResponse)
+async def edit_job_page(request: Request, job_id: str, store: MemoryStore = Depends(get_store)):
+    """Страница редактирования вакансии."""
+    job = store.jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return templates.TemplateResponse("job_form.html", {"request": request, "job": job})
+
+@app.get("/jobs/{job_id}/applications", response_class=HTMLResponse)
+async def applications_page(request: Request, job_id: str):
+    """Страница откликов по вакансии."""
+    return templates.TemplateResponse("applications.html", {"request": request, "job_id": job_id})
