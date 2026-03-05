@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h1>Вход для рекрутера</h1>
+<form id="loginForm">
+    <label for="recruiter_id">Ваш ID рекрутера:</label>
+    <input type="text" id="recruiter_id" name="recruiter_id" required>
+    <button type="submit">Войти</button>
+</form>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.getElementById('loginForm').addEventListener('submit', function(e) {
+    e.preventDefault();
+    const recruiterId = document.getElementById('recruiter_id').value.trim();
+    if (recruiterId) {
+        localStorage.setItem('recruiter_id', recruiterId);
+        window.location.href = '/jobs';
+    } else {
+        alert('Пожалуйста, введите ID рекрутера');
+    }
+});
+</script>
+{% endblock %}

@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HR Ассистент</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="navbar">
+            <a href="/jobs">Вакансии</a>
+            <a href="/jobs/new">Новая вакансия</a>
+            <a href="/">Сменить рекрутера</a>
+        </div>
+        {% block content %}{% endblock %}
+    </div>
+    <script>
+        function getRecruiterId() {
+            return localStorage.getItem('recruiter_id');
+        }
+
+        async function apiFetch(url, options = {}) {
+            const recruiterId = getRecruiterId();
+            if (!recruiterId) {
+                window.location.href = '/';
+                return;
+            }
+            options.headers = {
+                ...options.headers,
+                'X-Recruiter-ID': recruiterId,
+                'Content-Type': 'application/json',
+            };
+            const response = await fetch(url, options);
+            if (response.status === 401 || response.status === 403) {
+                alert('Ошибка авторизации. Перенаправление...');
+                window.location.href = '/';
+            }
+            return response;
+        }
+    </script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

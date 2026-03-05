@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h1>{{ "Редактирование вакансии" if job else "Новая вакансия" }}</h1>
+
+<!-- Скрытый элемент с данными вакансии (если есть) -->
+<div id="job-data" data-job="{{ job | tojson if job else 'null' }}"></div>
+
+<form id="jobForm">
+    <div>
+        <label>Название:</label>
+        <input type="text" id="title" value="{{ job.title if job else '' }}" required>
+    </div>
+    <div>
+        <label>Описание:</label>
+        <textarea id="description" required>{{ job.description if job else '' }}</textarea>
+    </div>
+    <div>
+        <label>Пороговый балл (0-100):</label>
+        <input type="number" id="threshold_score" min="0" max="100" value="{{ job.threshold_score if job else 70 }}" required>
+    </div>
+    <div>
+        <label>Дополнительные требования (JSON):</label>
+        <textarea id="requirements_json">{{ job.requirements_json | tojson if job else '' }}</textarea>
+    </div>
+    <button type="submit">Сохранить</button>
+</form>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.getElementById('jobForm').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    const data = {
+        title: document.getElementById('title').value,
+        description: document.getElementById('description').value,
+        threshold_score: parseInt(document.getElementById('threshold_score').value),
+        requirements_json: JSON.parse(document.getElementById('requirements_json').value || '{}')
+    };
+
+    const jobDataElement = document.getElementById('job-data');
+    const jobData = jobDataElement.dataset.job;
+
+    let url = '/api/jobs';
+    let method = 'POST';
+
+    if (jobData && jobData !== 'null') {
+        const job = JSON.parse(jobData);
+        url = '/api/jobs/' + job.id;
+        method = 'PUT';
+    }
+
+    const response = await apiFetch(url, {
+        method: method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+    });
+
+    if (response.ok) {
+        window.location.href = '/jobs';
+    } else {
+        alert('Ошибка сохранения');
+    }
+});
+</script>
+{% endblock %}
