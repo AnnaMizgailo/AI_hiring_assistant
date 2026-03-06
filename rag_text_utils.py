@@ -1,12 +1,72 @@
 import re
-from typing import List
+from typing import Iterable, List
+
+
+_STOPWORDS = {
+    "and",
+    "or",
+    "the",
+    "with",
+    "for",
+    "from",
+    "that",
+    "this",
+    "will",
+    "have",
+    "has",
+    "our",
+    "your",
+    "you",
+    "are",
+    "need",
+    "must",
+    "nice",
+    "required",
+    "requirements",
+    "responsibilities",
+    "опыт",
+    "нужно",
+    "важно",
+    "будет",
+    "ищем",
+    "команда",
+    "работа",
+    "релизы",
+    "метрики",
+    "обратной",
+    "связью",
+    "пользователей",
+    "уметь",
+    "писать",
+    "понятные",
+    "тикеты",
+}
+
+
+_ALIAS_REPLACEMENTS = [
+    ("ё", "е"),
+    ("next.js", "nextjs"),
+    ("next js", "nextjs"),
+    ("node.js", "nodejs"),
+    ("node js", "nodejs"),
+    ("postgresql", "postgres"),
+    ("postgre sql", "postgres"),
+    ("ci/cd", "cicd"),
+    ("ci cd", "cicd"),
+    ("a/b testing", "abtesting"),
+    ("ab testing", "abtesting"),
+    ("a b testing", "abtesting"),
+    ("type script", "typescript"),
+    ("rest api", "rest"),
+    ("job to be done", "jtbd"),
+    ("jobs to be done", "jtbd"),
+]
 
 
 def clean_text(text: str) -> str:
     if not text:
         return ""
-    text = text.replace("\u00a0", " ")
-    text = text.replace("\ufeff", "")
+    text = str(text).replace("\u00a0", " ").replace("\ufeff", "")
     text = re.sub(r"\r\n|\r", "\n", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -15,91 +75,129 @@ def clean_text(text: str) -> str:
 
 def normalize(text: str) -> str:
     t = clean_text(text).lower()
-    t = t.replace("ё", "е")
     t = t.replace("–", "-").replace("—", "-")
+    for src, dst in _ALIAS_REPLACEMENTS:
+        t = t.replace(src, dst)
     t = re.sub(r"\s+", " ", t)
     return t.strip()
 
 
-def split_into_chunks(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str]:
+def split_into_chunks(text: str, chunk_size: int = 900, overlap: int = 120) -> List[str]:
     text = clean_text(text)
     if not text:
         return []
 
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
     chunks: List[str] = []
     buf = ""
 
-    def flush_buf() -> None:
+    def flush() -> None:
         nonlocal buf
         if buf.strip():
             chunks.append(buf.strip())
         buf = ""
 
     for p in paragraphs:
-        if len(buf) + len(p) + 2 <= chunk_size:
-            buf = (buf + "\n\n" + p).strip() if buf else p
-        else:
-            flush_buf()
-            if len(p) <= chunk_size:
+        if len(p) <= chunk_size:
+            if not buf:
                 buf = p
+            elif len(buf) + len(p) + 2 <= chunk_size:
+                buf = (buf + "\n\n" + p).strip()
             else:
-                start = 0
-                while start < len(p):
-                    end = min(start + chunk_size, len(p))
-                    chunks.append(p[start:end].strip())
-                    if end >= len(p):
-                        break
-                    start = max(end - overlap, start + 1)
-                buf = ""
-
-    flush_buf()
-
-    if overlap > 0 and len(chunks) > 1:
-        overlapped: List[str] = []
-        for i, c in enumerate(chunks):
-            if i == 0:
-                overlapped.append(c)
-            else:
-                prev = overlapped[-1]
-                take = prev[-overlap:] if len(prev) > overlap else prev
-                overlapped.append((take + "\n" + c).strip())
-        chunks = overlapped
-
-    return [c for c in chunks if c]
-
-
-SECTION_HINTS = [
-    "skills", "technical skills", "kompetenzen", "kenntnisse", "навыки", "стек",
-    "experience", "professional experience", "berufserfahrung", "опыт",
-    "projects", "projekte", "education", "ausbildung", "зертifikate", "certifications", "образование"
-]
-
-
-def extract_resume_query(resume_text: str, max_chars: int = 1800) -> str:
-    t = clean_text(resume_text)
-    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
-    keep: List[str] = []
-    for ln in lines:
-        low = ln.lower()
-        if any(h in low for h in SECTION_HINTS):
-            keep.append(ln)
+                flush()
+                buf = p
             continue
-        if ("," in ln and len(ln) <= 160) or ("-" in ln and len(ln) <= 160):
-            keep.append(ln)
-    if len(" ".join(keep)) < 400:
-        keep = lines[:30]
-    query = " ".join(keep)
-    query = re.sub(r"\s+", " ", query).strip()
-    return query[:max_chars]
+
+        flush()
+        start = 0
+        while start < len(p):
+            end = min(len(p), start + chunk_size)
+            part = p[start:end].strip()
+            if part:
+                chunks.append(part)
+            if end >= len(p):
+                break
+            start = max(end - overlap, start + 1)
+
+    flush()
+
+    out: List[str] = []
+    seen = set()
+    for c in chunks:
+        cc = clean_text(c)
+        if not cc:
+            continue
+        key = normalize(cc)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cc)
+    return out
 
 
-def keyword_coverage(resume_text: str, job_keywords: List[str]) -> float:
-    if not job_keywords:
+def _tokenize(text: str) -> List[str]:
+    return re.findall(r"[a-zA-Zа-яА-Я0-9+#./-]{2,}", normalize(text))
+
+
+def skillish_keywords(values: Iterable[str], limit: int = 64) -> List[str]:
+    out: List[str] = []
+    seen = set()
+
+    for value in values:
+        text = clean_text(str(value or ""))
+        if not text:
+            continue
+
+        norm = normalize(text)
+        if norm and norm not in seen and (
+            " " in norm
+            or "+" in norm
+            or "#" in norm
+            or "." in norm
+            or "/" in norm
+            or norm in {
+                "python", "django", "fastapi", "flask", "postgres", "redis", "docker", "kubernetes",
+                "react", "typescript", "nextjs", "git", "rest", "graphql", "sql", "pandas",
+                "tableau", "abtesting", "airflow", "spark", "mlflow", "playwright", "selenium",
+                "jira", "cicd", "celery", "product management", "analytics", "roadmap", "jtbd"
+            }
+        ):
+            seen.add(norm)
+            out.append(text)
+
+        for tok in _tokenize(text):
+            if tok in _STOPWORDS:
+                continue
+            if len(tok) < 3:
+                continue
+            if tok in seen:
+                continue
+            seen.add(tok)
+            out.append(tok)
+            if len(out) >= limit:
+                return out
+
+    return out[:limit]
+
+
+def keyword_coverage(resume_text: str, required_keywords: List[str]) -> float:
+    if not required_keywords:
         return 0.0
+
     res = normalize(resume_text)
+    seen = set()
     hits = 0
-    for kw in job_keywords:
-        if normalize(kw) in res:
+    total = 0
+
+    for kw in required_keywords:
+        kk = normalize(kw)
+        if not kk or kk in seen:
+            continue
+        seen.add(kk)
+        total += 1
+        if kk in res:
             hits += 1
-    return round((hits / len(job_keywords)) * 100.0, 2)
+
+    if total == 0:
+        return 0.0
+    return round((hits / total) * 100.0, 2)

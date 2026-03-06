@@ -1,6 +1,5 @@
 import json
 import os
-import re
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -12,7 +11,7 @@ DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:1.7b")
 DEFAULT_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/api/generate")
 
 
-def ollama_generate(model: str, prompt: str, temperature: float = 0.15) -> str:
+def ollama_generate(model: str, prompt: str, temperature: float = 0.1) -> str:
     payload = {
         "model": model,
         "prompt": prompt,
@@ -34,174 +33,151 @@ def safe_json_loads(text: str) -> Dict[str, Any]:
     return json.loads(text)
 
 
-def simple_keywords_from_text(text: str) -> List[str]:
-    tokens = re.findall(r"[A-Za-zА-Яа-я][A-Za-zА-Яа-я0-9\+\#\.\-/]{1,30}", text)
-    stop = {
-        "job", "title", "location", "employment", "type", "company", "description",
-        "responsibilities", "requirements", "nice", "have", "salary", "keywords",
-        "remote", "команда", "будет", "работа", "важно", "ищем", "опыт", "skills"
-    }
-    out: List[str] = []
-    seen = set()
-    for t in tokens:
-        tl = t.lower()
-        if tl in stop:
-            continue
-        if len(t) < 2:
-            continue
-        if tl in seen:
-            continue
-        seen.add(tl)
-        out.append(t)
-    return out[:80]
+def _render_list(items: List[str]) -> str:
+    if not items:
+        return "- none"
+    return "\n".join([f"- {x}" for x in items])
 
 
 def build_scoring_prompt(
-    resume_text: str,
     job_title: str,
-    requirement_groups: Dict[str, List[str]],
+    deterministic_facts: Dict[str, Any],
     evidence_chunks: List[Dict[str, Any]],
-    keyword_coverage_percent: float,
-    evidence_keywords: List[str],
+    max_abs_adjustment: int,
 ) -> str:
-    must = requirement_groups.get("must_have", []) or []
-    nice = requirement_groups.get("nice_to_have", []) or []
-    other = requirement_groups.get("other", []) or []
-    all_reqs = requirement_groups.get("all", []) or []
+    must_have = deterministic_facts.get("must_have", []) or []
+    nice_to_have = deterministic_facts.get("nice_to_have", []) or []
+    must_hits = deterministic_facts.get("must_hits", []) or []
+    must_missing = deterministic_facts.get("must_missing", []) or []
+    nice_hits = deterministic_facts.get("nice_hits", []) or []
+    nice_missing = deterministic_facts.get("nice_missing", []) or []
+    other_hits = deterministic_facts.get("other_hits", []) or []
+    other_missing = deterministic_facts.get("other_missing", []) or []
+    deterministic_score = int(deterministic_facts.get("deterministic_score") or 0)
+    keyword_coverage_percent = float(deterministic_facts.get("keyword_coverage_percent") or 0.0)
 
-    def block(name: str, items: List[str]) -> str:
-        if not items:
-            return f"{name}:\n- none"
-        return name + ":\n" + "\n".join([f"- {x}" for x in items])
-
-    ev = "\n\n".join(
-        [
-            f"- Evidence {i + 1} (score={float(ch.get('score') or 0.0):.3f}, query={clean_text(str(ch.get('query') or ''))}):\n{clean_text(str(ch.get('text') or ''))}"
-            for i, ch in enumerate(evidence_chunks[:8])
-        ]
-    ) or "- No evidence retrieved"
-
-    kw_line = ", ".join(evidence_keywords)
-    req_line = "\n".join([f"- {x}" for x in all_reqs]) if all_reqs else "- none"
+    evidence = []
+    for i, item in enumerate(evidence_chunks[:6], start=1):
+        evidence.append(
+            f"Evidence {i}:\n"
+            f"text: {clean_text(str(item.get('text') or ''))}\n"
+            f"query: {clean_text(str(item.get('query') or ''))}\n"
+            f"score: {float(item.get('score') or 0.0):.3f}"
+        )
+    evidence_block = "\n\n".join(evidence) if evidence else "No evidence"
 
     return f"""
-You are an expert recruiter and ATS evaluator.
+You explain resume scoring.
 
-TASK:
-Review one candidate resume against one job using grounded evidence.
+You are NOT the primary scorer.
+The deterministic scorer is the source of truth for matched and missing requirements.
 
-RULES:
-- Use ONLY the provided resume and retrieved evidence.
-- Be realistic and strict.
-- Output MUST be valid JSON only.
-- You are NOT the primary scoring engine.
-- Do not return a final score.
-- Return a score_adjustment integer only in range [-5, 5].
-- negative adjustment should be rare and used only when evidence clearly contradicts the current fit.
-- If evidence is mixed or partial, keep score_adjustment near 0.
-- missing_requirements must contain only items from ALLOWED REQUIREMENTS below.
-- Use EVIDENCE KEYWORDS as the primary grounding source.
-- Do not invent unrelated tools.
-- evidence_snippets must reuse exact text from RETRIEVED RESUME EVIDENCE.
+Your job:
+1. Write a short factual rationale using the deterministic facts and evidence.
+2. Suggest a small integer score_adjustment between {-max_abs_adjustment} and {max_abs_adjustment}.
+3. Optionally highlight a subset of the already-missing requirements.
 
-JOB TITLE:
-{job_title}
+Rules:
+- Do not say a must-have requirement is met if it appears in MUST_HAVE_MISSING.
+- Do not invent skills.
+- Use only the evidence and facts below.
+- If deterministic facts say must-have coverage is weak, do not write that all must-have requirements are met.
+- focus_missing must be a subset of ALL_MISSING.
+- Return valid JSON only.
 
-REQUIREMENT GROUPS:
-{block('MUST_HAVE', must)}
+JOB_TITLE:
+{clean_text(job_title)}
 
-{block('NICE_TO_HAVE', nice)}
+MUST_HAVE:
+{_render_list(must_have)}
 
-{block('OTHER_REQUIREMENTS', other)}
+NICE_TO_HAVE:
+{_render_list(nice_to_have)}
 
-ALLOWED REQUIREMENTS:
-{req_line}
+MUST_HAVE_HITS:
+{_render_list(must_hits)}
 
-EVIDENCE KEYWORDS:
-{kw_line}
+MUST_HAVE_MISSING:
+{_render_list(must_missing)}
 
-KEYWORD COVERAGE:
-{keyword_coverage_percent}%
+NICE_TO_HAVE_HITS:
+{_render_list(nice_hits)}
 
-RESUME:
-{resume_text[:5000]}
+NICE_TO_HAVE_MISSING:
+{_render_list(nice_missing)}
 
-RETRIEVED RESUME EVIDENCE:
-{ev}
+OTHER_HITS:
+{_render_list(other_hits)}
 
-OUTPUT JSON SCHEMA:
+OTHER_MISSING:
+{_render_list(other_missing)}
+
+ALL_MISSING:
+{_render_list((must_missing + nice_missing + other_missing))}
+
+DETERMINISTIC_SCORE:
+{deterministic_score}
+
+KEYWORD_COVERAGE_PERCENT:
+{keyword_coverage_percent}
+
+EVIDENCE:
+{evidence_block}
+
+Return JSON:
 {{
   "rationale": "string",
-  "missing_requirements": ["string"],
   "score_adjustment": 0,
-  "evidence_snippets": [
-    {{
-      "text": "string",
-      "why": "string"
-    }}
-  ]
+  "focus_missing": ["string"]
 }}
 """.strip()
 
 
 def llm_score_application(
-    resume_text: str,
     job_title: str,
-    requirement_groups: Dict[str, List[str]],
+    deterministic_facts: Dict[str, Any],
     evidence_chunks: List[Dict[str, Any]],
-    keyword_coverage_percent: float,
     model: Optional[str] = None,
+    max_abs_adjustment: int = 5,
 ) -> Optional[Dict[str, Any]]:
-    evidence_text = "\n".join([clean_text(str(ch.get("text") or "")) for ch in evidence_chunks])
-    evidence_keywords = simple_keywords_from_text(evidence_text)
     prompt = build_scoring_prompt(
-        resume_text=resume_text,
         job_title=job_title,
-        requirement_groups=requirement_groups,
+        deterministic_facts=deterministic_facts,
         evidence_chunks=evidence_chunks,
-        keyword_coverage_percent=keyword_coverage_percent,
-        evidence_keywords=evidence_keywords,
+        max_abs_adjustment=max_abs_adjustment,
     )
-    raw = ollama_generate(model=model or DEFAULT_MODEL, prompt=prompt, temperature=0.15)
+
+    raw = ollama_generate(model=model or DEFAULT_MODEL, prompt=prompt, temperature=0.1)
+
     try:
         data = safe_json_loads(raw)
     except Exception:
         return None
+
     if not isinstance(data, dict):
         return None
 
-    rationale = str(data.get("rationale") or "").strip()
-    missing = data.get("missing_requirements") or []
-    evidence = data.get("evidence_snippets") or []
+    rationale = clean_text(str(data.get("rationale") or ""))
+    focus_missing = data.get("focus_missing") or []
     score_adjustment = data.get("score_adjustment", 0)
-
-    if not isinstance(missing, list):
-        missing = []
-    if not isinstance(evidence, list):
-        evidence = []
 
     try:
         score_adjustment = int(score_adjustment)
     except Exception:
         score_adjustment = 0
-    score_adjustment = max(-5, min(5, score_adjustment))
 
-    missing = [str(x).strip() for x in missing if str(x).strip()]
-    evidence_out: List[Dict[str, Any]] = []
-    for item in evidence[:12]:
-        if isinstance(item, dict):
-            txt = clean_text(str(item.get("text") or ""))
-            why = clean_text(str(item.get("why") or ""))
-            if txt:
-                evidence_out.append({"text": txt, "why": why})
+    score_adjustment = max(-max_abs_adjustment, min(max_abs_adjustment, score_adjustment))
+
+    if not isinstance(focus_missing, list):
+        focus_missing = []
+
+    focus_missing = [clean_text(str(x or "")) for x in focus_missing if clean_text(str(x or ""))]
 
     if not rationale:
         return None
 
     return {
         "rationale": rationale,
-        "missing_requirements": missing,
         "score_adjustment": score_adjustment,
-        "evidence_snippets": evidence_out,
-        "evidence_keywords": evidence_keywords,
+        "focus_missing": focus_missing,
     }
