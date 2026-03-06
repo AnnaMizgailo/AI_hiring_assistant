@@ -4,14 +4,14 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from rag_text_utils import clean_text, keyword_coverage
+from rag_text_utils import clean_text
 
 
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:1.7b")
 DEFAULT_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/api/generate")
 
 
-def ollama_generate(model: str, prompt: str, temperature: float = 0.2) -> str:
+def ollama_generate(model: str, prompt: str, temperature: float = 0.15) -> str:
     payload = {
         "model": model,
         "prompt": prompt,
@@ -34,140 +34,99 @@ def safe_json_loads(text: str) -> Dict[str, Any]:
     return json.loads(text)
 
 
-def simple_keywords_from_job_text(job_text: str) -> List[str]:
-    import re
-
-    tokens = re.findall(r"[A-Za-zА-Яа-я][A-Za-zА-Яа-я0-9\+\#\.\-/]{1,30}", job_text)
-
-    stop = {
-        "job",
-        "title",
-        "location",
-        "employment",
-        "type",
-        "company",
-        "description",
-        "responsibilities",
-        "requirements",
-        "nice",
-        "have",
-        "salary",
-        "keywords",
-        "remote",
-        "команда",
-        "будет",
-        "работа",
-        "важно",
-        "ищем",
-    }
-
-    out: List[str] = []
-    seen = set()
-
-    for t in tokens:
-        tl = t.lower()
-        if tl in stop:
-            continue
-        if len(t) < 2:
-            continue
-        if tl in seen:
-            continue
-        seen.add(tl)
-        out.append(t)
-
-    return out[:80]
+def _render_group(title: str, items: List[str]) -> str:
+    if not items:
+        return f"{title}:\n- none"
+    return title + ":\n" + "\n".join([f"- {x}" for x in items])
 
 
 def build_scoring_prompt(
-    resume_text: str,
     job_title: str,
     job_description: str,
-    requirements: List[str],
+    requirement_groups: Dict[str, List[str]],
     evidence_chunks: List[Dict[str, Any]],
 ) -> str:
-    reqs = "\n".join([f"- {r}" for r in requirements]) if requirements else "- No explicit requirements"
-    ev = "\n\n".join(
-        [
-            f"- Evidence (score={float(ch.get('score') or 0.0):.3f}):\n{clean_text(str(ch.get('text') or ''))}"
-            for ch in evidence_chunks
-        ]
-    )
+    must_have = requirement_groups.get("must_have", []) or []
+    nice_to_have = requirement_groups.get("nice_to_have", []) or []
+    other = requirement_groups.get("other", []) or []
+    all_requirements = requirement_groups.get("all", []) or []
 
-    job_text = f"{job_title}\n\n{job_description}\n\n" + "\n".join(requirements)
-    job_keywords = simple_keywords_from_job_text(job_text)
-    kw_cov = keyword_coverage(resume_text, job_keywords)
-    kw_line = ", ".join(job_keywords)
+    evidence_block = "\n\n".join(
+        [
+            f"EVIDENCE {i + 1} | similarity={float(ch.get('score') or 0.0):.3f} | query={clean_text(str(ch.get('query') or ''))}\n{clean_text(str(ch.get('text') or ''))}"
+            for i, ch in enumerate(evidence_chunks[:8])
+            if clean_text(str(ch.get("text") or ""))
+        ]
+    ) or "No evidence retrieved"
+
+    allowed_requirements = "\n".join([f"- {x}" for x in all_requirements]) if all_requirements else "- none"
 
     return f"""
-You are an expert recruiter and ATS evaluator.
+You are an expert ATS reviewer.
 
 TASK:
-Score how well a candidate matches ONE job.
+Review retrieved resume evidence for one candidate and one job.
+
+IMPORTANT:
+- You are not the primary scoring engine.
+- A deterministic scorer already computed the base score.
+- Your job is only to:
+  1) write a short grounded rationale
+  2) suggest missing requirements from the allowed list only
+  3) suggest a small score_adjustment between -10 and 10
+  4) choose the evidence snippets that best support your reasoning
 
 RULES:
-- Use ONLY the provided resume and retrieved evidence.
-- Be realistic and strict.
-- Output MUST be valid JSON only.
-- Score must be an integer from 0 to 100.
-- missing_requirements must contain only items from the REQUIREMENTS list below.
-- rationale must be short and factual.
-- evidence_snippets must be an array of objects with fields text and why.
-- If evidence is weak or indirect, keep the score lower.
-- Consider keyword coverage in your judgement.
+- Use only the evidence below.
+- Do not invent skills or experience.
+- Do not copy the prompt wrapper into evidence text.
+- Do not use one-word snippets like B1, Docker, REST as evidence.
+- Keep score_adjustment close to 0 unless the evidence is clearly much better or much worse than the base score would imply.
+- Output valid JSON only.
 
 JOB TITLE:
-{job_title}
+{clean_text(job_title)}
 
 JOB DESCRIPTION:
-{job_description}
+{clean_text(job_description)[:1800]}
 
-REQUIREMENTS:
-{reqs}
+{_render_group("MUST_HAVE", must_have)}
 
-JOB KEYWORDS:
-{kw_line}
+{_render_group("NICE_TO_HAVE", nice_to_have)}
 
-KEYWORD COVERAGE:
-{kw_cov}%
+{_render_group("OTHER_REQUIREMENTS", other)}
 
-RESUME:
-{resume_text}
+ALLOWED ITEMS FOR missing_requirements:
+{allowed_requirements}
 
 RETRIEVED RESUME EVIDENCE:
-{ev}
+{evidence_block}
 
 OUTPUT JSON SCHEMA:
 {{
-  "score": 0,
   "rationale": "string",
   "missing_requirements": ["string"],
-  "evidence_snippets": [
-    {{
-      "text": "string",
-      "why": "string"
-    }}
-  ]
+  "score_adjustment": 0,
+  "evidence_indices": [1, 2]
 }}
 """.strip()
 
 
 def llm_score_application(
-    resume_text: str,
     job_title: str,
     job_description: str,
-    requirements: List[str],
+    requirement_groups: Dict[str, List[str]],
     evidence_chunks: List[Dict[str, Any]],
     model: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     prompt = build_scoring_prompt(
-        resume_text=resume_text,
         job_title=job_title,
         job_description=job_description,
-        requirements=requirements,
+        requirement_groups=requirement_groups,
         evidence_chunks=evidence_chunks,
     )
 
-    raw = ollama_generate(model=model or DEFAULT_MODEL, prompt=prompt, temperature=0.2)
+    raw = ollama_generate(model=model or DEFAULT_MODEL, prompt=prompt, temperature=0.15)
 
     try:
         data = safe_json_loads(raw)
@@ -177,35 +136,41 @@ def llm_score_application(
     if not isinstance(data, dict):
         return None
 
-    if "score" not in data or "rationale" not in data or "missing_requirements" not in data:
-        return None
+    rationale = clean_text(str(data.get("rationale") or ""))
+    missing_requirements = data.get("missing_requirements") or []
+    evidence_indices = data.get("evidence_indices") or []
 
     try:
-        score = int(data.get("score"))
+        score_adjustment = int(data.get("score_adjustment", 0))
     except Exception:
+        score_adjustment = 0
+
+    score_adjustment = max(-10, min(10, score_adjustment))
+
+    if not isinstance(missing_requirements, list):
+        missing_requirements = []
+    if not isinstance(evidence_indices, list):
+        evidence_indices = []
+
+    normalized_missing = [clean_text(str(x)) for x in missing_requirements if clean_text(str(x))]
+
+    normalized_indices: List[int] = []
+    for idx in evidence_indices:
+        try:
+            iv = int(idx)
+        except Exception:
+            continue
+        if iv < 1 or iv > len(evidence_chunks):
+            continue
+        if iv not in normalized_indices:
+            normalized_indices.append(iv)
+
+    if not rationale:
         return None
 
-    rationale = str(data.get("rationale") or "").strip()
-    missing = data.get("missing_requirements") or []
-    evidence = data.get("evidence_snippets") or []
-
-    if not isinstance(missing, list):
-        missing = []
-    if not isinstance(evidence, list):
-        evidence = []
-
-    missing = [str(x).strip() for x in missing if str(x).strip()]
-    evidence_out: List[Dict[str, Any]] = []
-    for item in evidence[:12]:
-        if isinstance(item, dict):
-            txt = str(item.get("text") or "").strip()
-            why = str(item.get("why") or "").strip()
-            if txt:
-                evidence_out.append({"text": txt, "why": why})
-
     return {
-        "score": max(0, min(100, score)),
-        "rationale": rationale or "No rationale provided",
-        "missing_requirements": missing,
-        "evidence_snippets": evidence_out,
+        "rationale": rationale,
+        "missing_requirements": normalized_missing,
+        "score_adjustment": score_adjustment,
+        "evidence_indices": normalized_indices,
     }

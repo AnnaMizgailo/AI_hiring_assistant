@@ -2,10 +2,28 @@ import re
 from typing import List
 
 
+SECTION_HINTS = [
+    "skills",
+    "technical skills",
+    "kompetenzen",
+    "kenntnisse",
+    "experience",
+    "professional experience",
+    "berufserfahrung",
+    "projects",
+    "projekte",
+    "education",
+    "ausbildung",
+    "zertifikate",
+    "certifications",
+]
+
+
 def clean_text(text: str) -> str:
     if not text:
         return ""
     text = text.replace("\u00a0", " ")
+    text = text.replace("\ufeff", "")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\r\n|\r", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -13,7 +31,11 @@ def clean_text(text: str) -> str:
 
 
 def normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").lower()).strip()
+    t = clean_text(text).lower()
+    t = t.replace("ё", "е")
+    t = t.replace("–", "-").replace("—", "-")
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
 
 
 def split_into_chunks(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str]:
@@ -43,6 +65,8 @@ def split_into_chunks(text: str, chunk_size: int = 900, overlap: int = 150) -> L
                 while start < len(p):
                     end = min(start + chunk_size, len(p))
                     chunks.append(p[start:end].strip())
+                    if end >= len(p):
+                        break
                     start = max(end - overlap, start + 1)
                 buf = ""
 
@@ -68,29 +92,20 @@ def keyword_coverage(resume_text: str, job_keywords: List[str]) -> float:
 
     res = normalize(resume_text)
     hits = 0
+    seen = set()
 
     for kw in job_keywords:
-        if normalize(kw) in res:
+        nk = normalize(kw)
+        if not nk or nk in seen:
+            continue
+        seen.add(nk)
+        if nk in res:
             hits += 1
 
-    return round((hits / len(job_keywords)) * 100, 2)
+    if not seen:
+        return 0.0
 
-
-SECTION_HINTS = [
-    "skills",
-    "technical skills",
-    "kompetenzen",
-    "kenntnisse",
-    "experience",
-    "professional experience",
-    "berufserfahrung",
-    "projects",
-    "projekte",
-    "education",
-    "ausbildung",
-    "zertifikate",
-    "certifications",
-]
+    return round((hits / len(seen)) * 100, 2)
 
 
 def extract_resume_query(resume_text: str, max_chars: int = 1800) -> str:
