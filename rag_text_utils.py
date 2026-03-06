@@ -2,30 +2,13 @@ import re
 from typing import List
 
 
-SECTION_HINTS = [
-    "skills",
-    "technical skills",
-    "kompetenzen",
-    "kenntnisse",
-    "experience",
-    "professional experience",
-    "berufserfahrung",
-    "projects",
-    "projekte",
-    "education",
-    "ausbildung",
-    "zertifikate",
-    "certifications",
-]
-
-
 def clean_text(text: str) -> str:
     if not text:
         return ""
     text = text.replace("\u00a0", " ")
     text = text.replace("\ufeff", "")
-    text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\r\n|\r", "\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
@@ -86,32 +69,16 @@ def split_into_chunks(text: str, chunk_size: int = 900, overlap: int = 150) -> L
     return [c for c in chunks if c]
 
 
-def keyword_coverage(resume_text: str, job_keywords: List[str]) -> float:
-    if not job_keywords:
-        return 0.0
-
-    res = normalize(resume_text)
-    hits = 0
-    seen = set()
-
-    for kw in job_keywords:
-        nk = normalize(kw)
-        if not nk or nk in seen:
-            continue
-        seen.add(nk)
-        if nk in res:
-            hits += 1
-
-    if not seen:
-        return 0.0
-
-    return round((hits / len(seen)) * 100, 2)
+SECTION_HINTS = [
+    "skills", "technical skills", "kompetenzen", "kenntnisse", "навыки", "стек",
+    "experience", "professional experience", "berufserfahrung", "опыт",
+    "projects", "projekte", "education", "ausbildung", "зертifikate", "certifications", "образование"
+]
 
 
 def extract_resume_query(resume_text: str, max_chars: int = 1800) -> str:
     t = clean_text(resume_text)
     lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
-
     keep: List[str] = []
     for ln in lines:
         low = ln.lower()
@@ -120,10 +87,19 @@ def extract_resume_query(resume_text: str, max_chars: int = 1800) -> str:
             continue
         if ("," in ln and len(ln) <= 160) or ("-" in ln and len(ln) <= 160):
             keep.append(ln)
-
     if len(" ".join(keep)) < 400:
         keep = lines[:30]
-
     query = " ".join(keep)
     query = re.sub(r"\s+", " ", query).strip()
     return query[:max_chars]
+
+
+def keyword_coverage(resume_text: str, job_keywords: List[str]) -> float:
+    if not job_keywords:
+        return 0.0
+    res = normalize(resume_text)
+    hits = 0
+    for kw in job_keywords:
+        if normalize(kw) in res:
+            hits += 1
+    return round((hits / len(job_keywords)) * 100.0, 2)
