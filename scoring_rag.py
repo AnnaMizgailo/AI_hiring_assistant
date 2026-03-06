@@ -1,21 +1,25 @@
 from typing import Any, Dict, List, Tuple, Optional
-import uuid
+import asyncio
 import datetime
 import re
+import uuid
 
 import numpy as np
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import Application, Job, Profile, RagRun, Document
+from database import Application, Document, Job, Profile, RagRun
+from ollama_scoring import llm_score_application
+from rag_text_utils import clean_text, extract_resume_query, keyword_coverage, normalize, split_into_chunks
 
 
 _CONTAINER_KEYS = {
     "must_have",
+    "must_haves",
     "nice_to_have",
+    "nice_to_haves",
     "requirements",
     "requirement",
     "responsibilities",
@@ -28,62 +32,12 @@ _CONTAINER_KEYS = {
     "tech_stack",
     "stack",
     "tools",
-    "nice_to_haves",
-    "must_haves",
+    "summary",
 }
 
 
 def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-
-
-def _normalize_ws(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").strip())
-
-
-def _split_into_chunks(text: str, max_chars: int = 900, overlap: int = 160) -> List[str]:
-    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
-    parts = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
-
-    chunks: List[str] = []
-    buf = ""
-
-    for p in parts:
-        p = _normalize_ws(p)
-        if not p:
-            continue
-        if not buf:
-            buf = p
-            continue
-        if len(buf) + 1 + len(p) <= max_chars:
-            buf = buf + " " + p
-        else:
-            chunks.append(buf)
-            tail = buf[-overlap:] if overlap > 0 and len(buf) > overlap else ""
-            buf = (tail + " " + p).strip()
-
-    if buf:
-        chunks.append(buf)
-
-    out: List[str] = []
-    for ch in chunks:
-        ch = ch.strip()
-        if not ch:
-            continue
-        if len(ch) <= max_chars:
-            out.append(ch)
-            continue
-        start = 0
-        while start < len(ch):
-            end = min(len(ch), start + max_chars)
-            piece = ch[start:end].strip()
-            if piece:
-                out.append(piece)
-            if end >= len(ch):
-                break
-            start = max(0, end - overlap)
-
-    return out
 
 
 def _extract_strings_only(obj: Any, max_items: int = 400) -> List[str]:
@@ -96,7 +50,7 @@ def _extract_strings_only(obj: Any, max_items: int = 400) -> List[str]:
         if x is None:
             return
         if isinstance(x, str):
-            s = _normalize_ws(x)
+            s = clean_text(x)
             if s:
                 out.append(s)
             return
@@ -113,13 +67,62 @@ def _extract_strings_only(obj: Any, max_items: int = 400) -> List[str]:
                 if len(out) >= max_items:
                     break
                 rec(it)
-            return
 
     rec(obj)
 
-    seen = set()
     uniq: List[str] = []
+    seen = set()
     for s in out:
+        sl = s.lower()
+        if sl in seen:
+            continue
+        seen.add(sl)
+        uniq.append(s)
+    return uniq
+
+
+def _extract_requirements(requirements_json: Dict[str, Any]) -> List[str]:
+    rj = requirements_json or {}
+
+    reqs: List[str] = []
+    for k in ["must_have", "must_haves", "nice_to_have", "nice_to_haves", "experience", "languages", "requirements"]:
+        if k in rj:
+            reqs.extend(_extract_strings_only(rj.get(k), max_items=200))
+
+    if not reqs:
+        reqs = _extract_strings_only(rj, max_items=300)
+
+    cleaned: List[str] = []
+    seen = set()
+    for r in reqs:
+        rr = clean_text(r)
+        if not rr:
+            continue
+        rl = rr.lower()
+        if rl in _CONTAINER_KEYS:
+            continue
+        if len(rr) < 2:
+            continue
+        if rl in seen:
+            continue
+        seen.add(rl)
+        cleaned.append(rr)
+
+    return cleaned[:60]
+
+
+def _profile_skill_strings(profile_json: Dict[str, Any]) -> List[str]:
+    profile_json = profile_json or {}
+    items: List[str] = []
+    for key in ["skills", "technologies", "stack", "tools", "languages", "frameworks", "certifications", "summary", "projects", "experience"]:
+        if key in profile_json:
+            items.extend(_extract_strings_only(profile_json.get(key), max_items=250))
+    if not items:
+        items = _extract_strings_only(profile_json, max_items=500)
+
+    uniq: List[str] = []
+    seen = set()
+    for s in items:
         sl = s.lower()
         if sl in seen:
             continue
@@ -141,7 +144,7 @@ def _make_vectorizer() -> TfidfVectorizer:
 def _best_matches(query: str, vectorizer: TfidfVectorizer, matrix, chunks: List[str], k: int) -> List[Tuple[float, str]]:
     if not chunks:
         return []
-    q = _normalize_ws(query)
+    q = clean_text(query)
     if not q:
         return []
     qv = vectorizer.transform([q])
@@ -160,73 +163,17 @@ def _best_matches(query: str, vectorizer: TfidfVectorizer, matrix, chunks: List[
     return out
 
 
-def _profile_skill_strings(profile_json: Dict[str, Any]) -> List[str]:
-    profile_json = profile_json or {}
-    items: List[str] = []
-    for key in ["skills", "technologies", "stack", "tools", "languages", "frameworks", "certifications", "summary", "projects", "experience"]:
-        if key in profile_json:
-            items.extend(_extract_strings_only(profile_json.get(key), max_items=250))
-    if not items:
-        items = _extract_strings_only(profile_json, max_items=500)
-
-    seen = set()
-    uniq: List[str] = []
-    for s in items:
-        sl = s.lower()
-        if sl in seen:
-            continue
-        seen.add(sl)
-        uniq.append(s)
-    return uniq
-
-
-def _extract_requirements(requirements_json: Dict[str, Any]) -> List[str]:
-    rj = requirements_json or {}
-
-    reqs: List[str] = []
-    for k in ["must_have", "must_haves", "nice_to_have", "nice_to_haves", "experience", "languages"]:
-        if k in rj:
-            reqs.extend(_extract_strings_only(rj.get(k), max_items=200))
-
-    if not reqs:
-        reqs = _extract_strings_only(rj, max_items=300)
-
-    cleaned: List[str] = []
-    for r in reqs:
-        rr = _normalize_ws(r)
-        if not rr:
-            continue
-        if rr.lower() in _CONTAINER_KEYS:
-            continue
-        if len(rr) < 2:
-            continue
-        if len(rr) > 180:
-            rr = rr[:180].rstrip()
-        cleaned.append(rr)
-
-    seen = set()
-    out: List[str] = []
-    for r in cleaned:
-        rl = r.lower()
-        if rl in seen:
-            continue
-        seen.add(rl)
-        out.append(r)
-
-    return out[:60]
-
-
 def _resume_years_max(text: str) -> Optional[int]:
     t = (text or "").lower()
     candidates: List[int] = []
 
-    for m in re.finditer(r"\b(\d{1,2})\s*\+?\s*(?:years|yrs|year)\b", t):
+    for m in re.finditer(r"\b(\d{1,2})\s*\+?\s*(?:years|yrs|year|года|лет|год)\b", t):
         try:
             candidates.append(int(m.group(1)))
         except Exception:
             pass
 
-    for m in re.finditer(r"\b(\d{1,2})\s*[-–]\s*(\d{1,2})\s*(?:years|yrs|year)\b", t):
+    for m in re.finditer(r"\b(\d{1,2})\s*[-–]\s*(\d{1,2})\s*(?:years|yrs|year|года|лет|год)\b", t):
         try:
             a = int(m.group(1))
             b = int(m.group(2))
@@ -241,13 +188,13 @@ def _resume_years_max(text: str) -> Optional[int]:
 
 def _required_years(req: str) -> Optional[int]:
     r = (req or "").lower()
-    m = re.search(r"\b(\d{1,2})\s*\+\s*(?:years|yrs|year)\b", r)
+    m = re.search(r"\b(\d{1,2})\s*\+\s*(?:years|yrs|year|года|лет|год)\b", r)
     if m:
         try:
             return int(m.group(1))
         except Exception:
             return None
-    m = re.search(r"\b(\d{1,2})\s*(?:years|yrs|year)\b", r)
+    m = re.search(r"\b(\d{1,2})\s*(?:years|yrs|year|года|лет|год)\b", r)
     if m:
         try:
             return int(m.group(1))
@@ -258,9 +205,7 @@ def _required_years(req: str) -> Optional[int]:
 
 def _match_experience_requirement(req: str, resume_text: str, profile_strings: List[str]) -> Optional[bool]:
     rl = (req or "").lower()
-    if "year" not in rl and "yrs" not in rl:
-        return None
-    if "experience" not in rl and "exp" not in rl and "backend" not in rl and "developer" not in rl and "development" not in rl:
+    if "year" not in rl and "yrs" not in rl and "опыт" not in rl and "лет" not in rl and "года" not in rl and "год" not in rl:
         return None
 
     need = _required_years(req)
@@ -279,7 +224,7 @@ def _match_experience_requirement(req: str, resume_text: str, profile_strings: L
 
 
 def _match_requirement(req: str, skill_strings: List[str], evidence_chunks: List[Dict[str, Any]], resume_text: str) -> bool:
-    r = _normalize_ws(req)
+    r = clean_text(req)
     if not r:
         return True
 
@@ -304,18 +249,6 @@ def _match_requirement(req: str, skill_strings: List[str], evidence_chunks: List
     return False
 
 
-def _job_as_text(job: Job) -> str:
-    reqs = _extract_requirements(job.requirements_json or {})
-    return "\n\n".join(
-        [
-            f"TITLE: {job.title}",
-            job.description or "",
-            "REQUIREMENTS:",
-            "\n".join(reqs),
-        ]
-    ).strip()
-
-
 def _pick_latest_document(docs: List[Document]) -> Optional[Document]:
     if not docs:
         return None
@@ -328,6 +261,20 @@ def _pick_latest_document(docs: List[Document]) -> Optional[Document]:
         reverse=True,
     )
     return docs_sorted[0]
+
+
+def _job_as_text(job: Job) -> str:
+    reqs = _extract_requirements(job.requirements_json or {})
+    return clean_text(
+        "\n\n".join(
+            [
+                f"TITLE: {job.title}",
+                job.description or "",
+                "REQUIREMENTS:",
+                "\n".join(reqs),
+            ]
+        )
+    )
 
 
 def _format_evidence(scored_chunks: List[Dict[str, Any]], limit: int = 12) -> List[Dict[str, Any]]:
@@ -361,7 +308,8 @@ async def index_job(db: AsyncSession, job_id: str) -> int:
     job = job_result.scalar_one_or_none()
     if not job:
         raise RuntimeError(f"Job {job_id} not found")
-    chunks = _split_into_chunks(_job_as_text(job))
+    text = _job_as_text(job)
+    chunks = split_into_chunks(text)
     return len(chunks)
 
 
@@ -372,7 +320,7 @@ async def index_resume(db: AsyncSession, document_id: str) -> int:
         raise RuntimeError(f"Document {document_id} not found")
     if not doc.raw_text:
         raise RuntimeError("document raw_text not ready")
-    chunks = _split_into_chunks((doc.raw_text or "").strip())
+    chunks = split_into_chunks(clean_text(doc.raw_text))
     return len(chunks)
 
 
@@ -392,24 +340,30 @@ async def retrieve_evidence(db: AsyncSession, job_id: str, candidate_id: str, k:
     if not doc or not doc.raw_text:
         return []
 
-    resume_text = (doc.raw_text or "").strip()
-    resume_chunks = _split_into_chunks(resume_text)
+    resume_text = clean_text(doc.raw_text)
+    resume_chunks = split_into_chunks(resume_text)
     if not resume_chunks:
         return []
 
     vectorizer = _make_vectorizer()
     matrix = vectorizer.fit_transform(resume_chunks)
 
-    queries = _extract_requirements(job.requirements_json or {})
+    reqs = _extract_requirements(job.requirements_json or {})
+    queries: List[str] = []
     if job.title:
-        queries = [job.title] + queries
+        queries.append(clean_text(job.title))
     if job.description:
-        queries = queries + [job.description[:900]]
+        queries.append(clean_text(job.description[:1200]))
+    queries.extend(reqs)
 
-    seen = set()
+    resume_query = extract_resume_query(resume_text)
+    if resume_query:
+        queries.append(resume_query)
+
     uniq_queries: List[str] = []
+    seen = set()
     for q in queries:
-        qq = _normalize_ws(q)
+        qq = clean_text(q)
         if not qq:
             continue
         ql = qq.lower()
@@ -417,9 +371,6 @@ async def retrieve_evidence(db: AsyncSession, job_id: str, candidate_id: str, k:
             continue
         seen.add(ql)
         uniq_queries.append(qq)
-
-    if not uniq_queries:
-        return []
 
     scored: Dict[str, Dict[str, Any]] = {}
     per_query_k = max(3, min(12, k * 3))
@@ -444,19 +395,45 @@ async def calculate_score(
     requirements_json: Dict[str, Any],
     profile_json: Dict[str, Any],
     evidence_chunks: List[Dict[str, Any]],
+    job_title: str = "",
+    job_description: str = "",
+    resume_text: str = "",
 ) -> Tuple[int, str, List[str], List[Dict[str, Any]]]:
     reqs = _extract_requirements(requirements_json or {})
     skill_strings = _profile_skill_strings(profile_json or {})
 
-    resume_text = " ".join([(e.get("text") or "") for e in (evidence_chunks or []) if isinstance(e.get("text"), str)])
-    resume_text = _normalize_ws(resume_text)
+    use_ollama = True
+
+    if use_ollama and evidence_chunks:
+        try:
+            llm = await asyncio.to_thread(
+                llm_score_application,
+                clean_text(resume_text),
+                job_title,
+                clean_text(job_description),
+                reqs,
+                evidence_chunks,
+            )
+        except Exception:
+            llm = None
+
+        if llm is not None:
+            score = int(llm["score"])
+            rationale = str(llm["rationale"])
+            missing = list(llm["missing_requirements"])
+            evidence = _format_evidence(evidence_chunks or [], limit=12)
+            return score, rationale, missing, evidence
+
+    resume_joined = clean_text(
+        resume_text or " ".join([(e.get("text") or "") for e in (evidence_chunks or []) if isinstance(e.get("text"), str)])
+    )
 
     hits: List[str] = []
     missing: List[str] = []
 
     if reqs:
         for r in reqs:
-            if _match_requirement(r, skill_strings, evidence_chunks, resume_text):
+            if _match_requirement(r, skill_strings, evidence_chunks, resume_joined):
                 hits.append(r)
             else:
                 missing.append(r)
@@ -498,8 +475,8 @@ async def save_scoring(
         id=str(uuid.uuid4()),
         application_id=application_id,
         top_k_chunks_json=evidence,
-        prompt_version="v0",
-        model_version="local_tfidf",
+        prompt_version="ollama_rag_v1",
+        model_version="ollama_local",
         created_at=_utcnow(),
     )
     db.add(rag_run)
@@ -521,15 +498,42 @@ async def score_application(db: AsyncSession, application_id: str) -> Dict[str, 
     if not profile:
         raise RuntimeError("candidate profile not ready")
 
-    evidence_chunks = await retrieve_evidence(db, job_id=app.job_id, candidate_id=app.candidate_id, k=5)
+    docs_result = await db.execute(
+        select(Document)
+        .where(Document.candidate_id == app.candidate_id)
+        .where(Document.raw_text.isnot(None))
+    )
+    docs = list(docs_result.scalars().all())
+    doc = _pick_latest_document(docs)
+    if not doc or not doc.raw_text:
+        raise RuntimeError("candidate documents not found")
+
+    resume_text = clean_text(doc.raw_text)
+    evidence_chunks = await retrieve_evidence(
+        db,
+        job_id=app.job_id,
+        candidate_id=app.candidate_id,
+        k=5,
+    )
 
     score, rationale, missing, evidence = await calculate_score(
         job.requirements_json or {},
         profile.profile_json,
         evidence_chunks,
+        job_title=job.title or "",
+        job_description=job.description or "",
+        resume_text=resume_text,
     )
 
-    await save_scoring(db, application_id, score, rationale, missing, evidence)
+    await save_scoring(
+        db,
+        application_id,
+        score,
+        rationale,
+        missing,
+        evidence,
+    )
+
     await db.commit()
 
     return {
