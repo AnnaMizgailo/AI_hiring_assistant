@@ -19,12 +19,14 @@ from parsing import save_resume_file, parse_document
 from scoring_rag import score_application
 from calendar_llm import get_google_oauth_url, handle_google_callback, get_available_slots, book_slot
 
-# === Pydantic модели (оставляем как есть) ===
+
+# === Pydantic модели ===
 class JobCreate(BaseModel):
     title: str
     description: str
     threshold_score: int = Field(ge=0, le=100)
     requirements_json: Optional[Dict[str, Any]] = None
+
 
 class JobUpdate(BaseModel):
     title: Optional[str] = None
@@ -32,11 +34,13 @@ class JobUpdate(BaseModel):
     threshold_score: Optional[int] = Field(None, ge=0, le=100)
     requirements_json: Optional[Dict[str, Any]] = None
 
+
 class JobOut(BaseModel):
     id: str
     title: str
     threshold_score: int
     created_at: str
+
 
 class ApplicationOut(BaseModel):
     application_id: str
@@ -47,15 +51,18 @@ class ApplicationOut(BaseModel):
     screening_summary: Optional[str] = None
     created_at: str
 
+
 class CreateApplicationIn(BaseModel):
     job_id: str
     telegram_user_id: int
     telegram_username: Optional[str] = None
 
+
 class CreateApplicationOut(BaseModel):
     application_id: str
     candidate_id: str
     status: str
+
 
 class ScoreOut(BaseModel):
     application_id: str
@@ -64,11 +71,14 @@ class ScoreOut(BaseModel):
     missing_requirements: List[str]
     evidence_snippets: List[Dict[str, Any]]
 
+
 class SlotsOut(BaseModel):
     slots: List[Dict[str, Any]]
 
+
 class BookSlotIn(BaseModel):
     slot_id: str
+
 
 class BookSlotOut(BaseModel):
     status: str
@@ -76,11 +86,14 @@ class BookSlotOut(BaseModel):
     start_dt: str
     end_dt: str
 
+
 class GoogleOauthOut(BaseModel):
     auth_url: str
 
+
 class GoogleCallbackOut(BaseModel):
     status: str
+
 
 # === Приложение FastAPI ===
 app = FastAPI(title="HR Assistant Prototype")
@@ -89,27 +102,31 @@ app = FastAPI(title="HR Assistant Prototype")
 templates = Jinja2Templates(directory="templates")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+
 # === Инициализация БД при старте ===
 @app.on_event("startup")
 async def startup_event():
     await init_db()
 
+
 # === Вспомогательные функции ===
 def now_iso() -> str:
     return datetime.datetime.utcnow().isoformat() + "Z"
+
 
 async def get_current_recruiter(recruiter_id: Optional[str] = Header(None, alias="X-Recruiter-ID")):
     if not recruiter_id:
         raise HTTPException(status_code=401, detail="Missing recruiter ID")
     return recruiter_id
 
+
 # === Эндпоинты ===
 
 @app.post("/api/jobs", response_model=Dict[str, str])
 async def create_job(
-    payload: JobCreate,
-    recruiter: str = Depends(get_current_recruiter),
-    db: AsyncSession = Depends(get_db)
+        payload: JobCreate,
+        recruiter: str = Depends(get_current_recruiter),
+        db: AsyncSession = Depends(get_db)
 ):
     jid = str(uuid.uuid4())
     job = Job(
@@ -126,10 +143,11 @@ async def create_job(
     await db.commit()
     return {"job_id": jid}
 
+
 @app.get("/api/jobs", response_model=List[JobOut])
 async def list_jobs(
-    recruiter: str = Depends(get_current_recruiter),
-    db: AsyncSession = Depends(get_db)
+        recruiter: str = Depends(get_current_recruiter),
+        db: AsyncSession = Depends(get_db)
 ):
     result = await db.execute(
         select(Job).where(Job.recruiter_id == recruiter)
@@ -145,11 +163,12 @@ async def list_jobs(
         for j in jobs
     ]
 
+
 @app.get("/api/jobs/{job_id}", response_model=Dict[str, Any])
 async def get_job(
-    job_id: str,
-    recruiter: str = Depends(get_current_recruiter),
-    db: AsyncSession = Depends(get_db)
+        job_id: str,
+        recruiter: str = Depends(get_current_recruiter),
+        db: AsyncSession = Depends(get_db)
 ):
     result = await db.execute(
         select(Job).where(Job.id == job_id, Job.recruiter_id == recruiter)
@@ -168,12 +187,13 @@ async def get_job(
         "recruiter_id": job.recruiter_id
     }
 
+
 @app.put("/api/jobs/{job_id}", response_model=Dict[str, str])
 async def update_job(
-    job_id: str,
-    payload: JobUpdate,
-    recruiter: str = Depends(get_current_recruiter),
-    db: AsyncSession = Depends(get_db)
+        job_id: str,
+        payload: JobUpdate,
+        recruiter: str = Depends(get_current_recruiter),
+        db: AsyncSession = Depends(get_db)
 ):
     result = await db.execute(
         select(Job).where(Job.id == job_id, Job.recruiter_id == recruiter)
@@ -191,11 +211,12 @@ async def update_job(
     await db.commit()
     return {"job_id": job_id, "status": "updated"}
 
+
 @app.delete("/api/jobs/{job_id}", response_model=Dict[str, str])
 async def delete_job(
-    job_id: str,
-    recruiter: str = Depends(get_current_recruiter),
-    db: AsyncSession = Depends(get_db)
+        job_id: str,
+        recruiter: str = Depends(get_current_recruiter),
+        db: AsyncSession = Depends(get_db)
 ):
     result = await db.execute(
         select(Job).where(Job.id == job_id, Job.recruiter_id == recruiter)
@@ -208,20 +229,17 @@ async def delete_job(
     await db.commit()
     return {"job_id": job_id, "status": "deleted"}
 
+
 @app.post("/api/applications", response_model=CreateApplicationOut)
 async def create_application(
-    payload: CreateApplicationIn,
-    db: AsyncSession = Depends(get_db)
+        payload: CreateApplicationIn,
+        db: AsyncSession = Depends(get_db)
 ):
-    # Проверяем существование вакансии
-    job_result = await db.execute(
-        select(Job).where(Job.id == payload.job_id)
-    )
+    job_result = await db.execute(select(Job).where(Job.id == payload.job_id))
     job = job_result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
 
-    # Ищем кандидата по telegram_user_id или создаём нового
     cand_result = await db.execute(
         select(Candidate).where(Candidate.telegram_user_id == payload.telegram_user_id)
     )
@@ -235,7 +253,7 @@ async def create_application(
             created_at=datetime.datetime.utcnow()
         )
         db.add(candidate)
-        await db.flush()  # чтобы получить id, но он уже сгенерирован
+        await db.flush()
     else:
         candidate_id = candidate.id
 
@@ -257,16 +275,16 @@ async def create_application(
         "status": "NEW"
     }
 
+
 @app.get("/api/jobs/{job_id}/applications", response_model=List[ApplicationOut])
 async def list_applications(
-    job_id: str,
-    status: Optional[str] = None,
-    min_score: Optional[int] = Query(None, ge=0, le=100),
-    max_score: Optional[int] = Query(None, ge=0, le=100),
-    recruiter: str = Depends(get_current_recruiter),
-    db: AsyncSession = Depends(get_db)
+        job_id: str,
+        status: Optional[str] = None,
+        min_score: Optional[int] = Query(None, ge=0, le=100),
+        max_score: Optional[int] = Query(None, ge=0, le=100),
+        recruiter: str = Depends(get_current_recruiter),
+        db: AsyncSession = Depends(get_db)
 ):
-    # Проверяем, что вакансия принадлежит рекрутеру
     job_result = await db.execute(
         select(Job).where(Job.id == job_id, Job.recruiter_id == recruiter)
     )
@@ -274,7 +292,6 @@ async def list_applications(
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
 
-    # Базовый запрос
     query = select(Application).where(Application.job_id == job_id)
     if status:
         query = query.where(Application.status == status)
@@ -288,9 +305,7 @@ async def list_applications(
 
     out = []
     for app in apps:
-        cand_result = await db.execute(
-            select(Candidate).where(Candidate.id == app.candidate_id)
-        )
+        cand_result = await db.execute(select(Candidate).where(Candidate.id == app.candidate_id))
         candidate = cand_result.scalar_one_or_none()
         out.append({
             "application_id": app.id,
@@ -302,106 +317,86 @@ async def list_applications(
             "created_at": app.created_at.isoformat() + "Z",
         })
 
-    # Сортировка: сначала с баллом (по убыванию), потом без балла
     out.sort(key=lambda x: (x["score"] is None, -(x["score"] or 0)))
     return out
 
+
 @app.post("/api/candidates/{candidate_id}/documents", response_model=Dict[str, str])
 async def upload_document(
-    candidate_id: str,
-    file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db)
+        candidate_id: str,
+        file: UploadFile = File(...),
+        db: AsyncSession = Depends(get_db)
 ):
-    # Проверяем существование кандидата
-    cand_result = await db.execute(
-        select(Candidate).where(Candidate.id == candidate_id)
-    )
+    cand_result = await db.execute(select(Candidate).where(Candidate.id == candidate_id))
     candidate = cand_result.scalar_one_or_none()
     if not candidate:
         raise HTTPException(status_code=404, detail="candidate not found")
 
     file_bytes = await file.read()
-    # Функция save_resume_file должна быть адаптирована для работы с БД (принимать db)
-    # Пока оставим как есть, но потом нужно переписать
-    # Временно сохраняем файл и запись в БД прямо здесь
-    os.makedirs("/mnt/data/storage_resumes", exist_ok=True)
-    document_id = str(uuid.uuid4())
-    safe_name = file.filename or f"{document_id}.bin"
-    file_path = os.path.join("/mnt/data/storage_resumes", f"{document_id}__{safe_name}")
-    with open(file_path, "wb") as f:
-        f.write(file_bytes)
 
-    doc = Document(
-        id=document_id,
+    # Теперь используем save_resume_file из parsing.py для чистоты кода
+    result = await save_resume_file(
+        db=db,
         candidate_id=candidate_id,
-        file_name=safe_name,
+        file_bytes=file_bytes,
+        filename=file.filename or "",
         mime_type=file.content_type or "",
-        file_path=file_path,
-        parse_status="PENDING"
     )
-    db.add(doc)
     await db.commit()
 
-    return {"document_id": document_id}
+    return {"document_id": result["document_id"]}
+
 
 @app.post("/api/parsing/run", response_model=Dict[str, Any])
 async def run_parsing(
-    document_id: str,
-    db: AsyncSession = Depends(get_db)
+        document_id: str,
+        db: AsyncSession = Depends(get_db)
 ):
-    # Функция parse_document должна быть адаптирована для работы с БД
-    # Пока используем заглушку, но в реальности нужно переписать
-    doc_result = await db.execute(
-        select(Document).where(Document.id == document_id)
-    )
+    doc_result = await db.execute(select(Document).where(Document.id == document_id))
     doc = doc_result.scalar_one_or_none()
     if not doc:
         raise HTTPException(status_code=404, detail="document not found")
 
-    # Вызываем parse_document, передавая db
-    res = await parse_document(db, document_id)  # нужно адаптировать parse_document
+    res = await parse_document(db, document_id)
     return res
+
 
 @app.post("/api/applications/{application_id}/score", response_model=ScoreOut)
 async def run_scoring(
-    application_id: str,
-    db: AsyncSession = Depends(get_db)
+        application_id: str,
+        db: AsyncSession = Depends(get_db)
 ):
-    app_result = await db.execute(
-        select(Application).where(Application.id == application_id)
-    )
+    app_result = await db.execute(select(Application).where(Application.id == application_id))
     app = app_result.scalar_one_or_none()
     if not app:
         raise HTTPException(status_code=404, detail="application not found")
 
-    res = await score_application(db, application_id)  # адаптировать
+    res = await score_application(db, application_id)
     return res
 
-# Остальные эндпоинты (Google, слоты) аналогично требуют адаптации.
-# Для краткости я пропущу их, но принцип тот же: заменить store на db и использовать SQLAlchemy.
 
-# === Веб-интерфейс (остаётся без изменений) ===
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse("login.html", {"request": request})
+
 
 @app.get("/jobs", response_class=HTMLResponse)
 async def jobs_page(request: Request):
     return templates.TemplateResponse("jobs.html", {"request": request})
 
+
 @app.get("/jobs/new", response_class=HTMLResponse)
 async def new_job_page(request: Request):
     return templates.TemplateResponse("job_form.html", {"request": request, "job": None})
 
+
 @app.get("/jobs/{job_id}/edit", response_class=HTMLResponse)
 async def edit_job_page(request: Request, job_id: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(Job).where(Job.id == job_id)
-    )
+    result = await db.execute(select(Job).where(Job.id == job_id))
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    # Преобразуем job в словарь для шаблона (можно использовать сериализацию)
+
     job_dict = {
         "id": job.id,
         "title": job.title,
@@ -413,6 +408,7 @@ async def edit_job_page(request: Request, job_id: str, db: AsyncSession = Depend
         "recruiter_id": job.recruiter_id
     }
     return templates.TemplateResponse("job_form.html", {"request": request, "job": job_dict})
+
 
 @app.get("/jobs/{job_id}/applications", response_class=HTMLResponse)
 async def applications_page(request: Request, job_id: str):
