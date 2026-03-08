@@ -1,1 +1,18 @@
 __pycache__
+
+# Окружение и кэш
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Настройки PyCharm
+.idea/
+
+# База данных и логи
+*.db
+*.log
+storage_resumes/
+
+# Системные файлы Mac
+.DS_Store
