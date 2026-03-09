@@ -18,9 +18,14 @@ from authlib.integrations.starlette_client import OAuth
 from starlette.config import Config
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import EmailStr
+import logging
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 # Конфигурация JWT
-SECRET_KEY = os.getenv("SECRET_KEY", "change_this_in_production")
+# Захардкоженный ключ для локального прототипа
+SECRET_KEY = "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
@@ -797,17 +802,24 @@ async def login(login_data: RecruiterLogin, db: AsyncSession = Depends(get_db)):
         "full_name": recruiter.full_name
     }
 
+    
 @app.get("/api/auth/google/login")
 async def google_login(request: Request):
-    redirect_uri = request.url_for('google_callback')
+    # Теперь мы ссылаемся на УНИКАЛЬНОЕ имя функции
+    redirect_uri = request.url_for('auth_google_callback')
+    logger.info(f"Initiating Google Login. Redirect URI resolved to: {redirect_uri}")
     return await oauth.google.authorize_redirect(request, redirect_uri)
 
+
 @app.get("/api/auth/google/callback")
-async def google_callback(request: Request, db: AsyncSession = Depends(get_db)):
+async def auth_google_callback(request: Request, db: AsyncSession = Depends(get_db)):
+    logger.info("Entered auth_google_callback endpoint")
     try:
         token = await oauth.google.authorize_access_token(request)
         user_info = token.get('userinfo')
+        
         if not user_info:
+            logger.error("Failed to get user_info from Google token")
             raise HTTPException(status_code=400, detail="Could not get user info from Google")
 
         email = user_info.get('email')
@@ -815,7 +827,10 @@ async def google_callback(request: Request, db: AsyncSession = Depends(get_db)):
         full_name = user_info.get('name')
         avatar_url = user_info.get('picture')
 
+        logger.info(f"Successfully fetched Google user: {email} (ID: {google_id})")
+
         if not email or not google_id:
+            logger.error(f"Missing essential fields: email={email}, sub={google_id}")
             raise HTTPException(status_code=400, detail="Missing required user info from Google")
 
         # Ищем существующего рекрутера по email или google_id
@@ -827,14 +842,14 @@ async def google_callback(request: Request, db: AsyncSession = Depends(get_db)):
         recruiter = result.scalar_one_or_none()
 
         if recruiter:
-            # Обновляем данные
+            logger.info(f"Found existing recruiter in DB: {recruiter.id}")
             if not recruiter.google_id:
                 recruiter.google_id = google_id
             if not recruiter.avatar_url and avatar_url:
                 recruiter.avatar_url = avatar_url
             recruiter.updated_at = datetime.utcnow()
         else:
-            # Создаём нового
+            logger.info("Creating new recruiter in DB")
             recruiter_id = str(uuid.uuid4())
             recruiter = Recruiter(
                 id=recruiter_id,
@@ -848,14 +863,15 @@ async def google_callback(request: Request, db: AsyncSession = Depends(get_db)):
             db.add(recruiter)
 
         await db.commit()
+        logger.info("DB commit successful")
 
         # Создаём JWT токен
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
             data={"sub": recruiter.id}, expires_delta=access_token_expires
         )
+        logger.info(f"Generated JWT token for recruiter: {recruiter.id}")
 
-        # Возвращаем HTML с закрытием окна и отправкой токена обратно (как в предыдущем варианте)
         return HTMLResponse(content=f"""
         <!DOCTYPE html>
         <html>
@@ -881,6 +897,7 @@ async def google_callback(request: Request, db: AsyncSession = Depends(get_db)):
             </div>
             <script>
                 if (window.opener) {{
+                    console.log("Sending message to opener...");
                     window.opener.postMessage({{
                         type: 'google-auth-success',
                         token: '{access_token}',
@@ -889,6 +906,8 @@ async def google_callback(request: Request, db: AsyncSession = Depends(get_db)):
                         full_name: '{full_name or ""}'
                     }}, '*');
                     setTimeout(() => window.close(), 2000);
+                }} else {{
+                    console.log("No window.opener found. Cannot pass token automatically.");
                 }}
             </script>
         </body>
@@ -896,6 +915,7 @@ async def google_callback(request: Request, db: AsyncSession = Depends(get_db)):
         """)
 
     except Exception as e:
+        logger.exception("Error occurred during Google Callback processing:")
         return HTMLResponse(content=f"""
         <!DOCTYPE html>
         <html>
@@ -903,11 +923,8 @@ async def google_callback(request: Request, db: AsyncSession = Depends(get_db)):
             <title>Ошибка входа</title>
         </head>
         <body>
-            <div class="message">
-                <h1>❌ Ошибка входа</h1>
-                <p>{str(e)}</p>
-                <button onclick="window.close()">Закрыть</button>
-            </div>
+            <h1>Произошла ошибка при входе</h1>
+            <p>{str(e)}</p>
         </body>
         </html>
         """)
