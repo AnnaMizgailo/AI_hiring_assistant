@@ -2,6 +2,7 @@
 
 {% block content %}
 <h1>Мои вакансии</h1>
+<p>Сначала создай вакансию, затем подключи Google Calendar на вкладке Google Calendar. После этого кандидат сможет пройти путь через Telegram-бота.</p>
 <button onclick="createJob()" class="btn"><i class="fas fa-plus"></i> Создать вакансию</button>
 <table id="jobsTable">
     <thead>
@@ -31,6 +32,7 @@ async function loadJobs() {
             <td>${new Date(job.created_at).toLocaleString()}</td>
              <td>
                 <button onclick="viewApplications('${job.id}')" class="btn btn-sm"><i class="fas fa-list"></i> Отклики</button>
+                <button onclick="openSlots('${job.id}')" class="btn btn-sm"><i class="fas fa-calendar"></i> Слоты</button>
                 <button onclick="editJob('${job.id}')" class="btn btn-sm"><i class="fas fa-edit"></i> Редактировать</button>
                 <button onclick="deleteJob('${job.id}')" class="btn btn-sm btn-danger"><i class="fas fa-trash"></i> Удалить</button>
             </td>
@@ -42,6 +44,11 @@ async function loadJobs() {
 function createJob() { window.location.href = '/jobs/new'; }
 function editJob(id) { window.location.href = `/jobs/${id}/edit`; }
 function viewApplications(id) { window.location.href = `/jobs/${id}/applications`; }
+async function openSlots(id) {
+    const response = await apiFetch(`/api/jobs/${id}/slots`, { method: 'POST' });
+    const data = await response.json();
+    alert('Слоты подготовлены: ' + (data.slots || []).map(s => s.label + ' [' + s.status + ']').join('\n'));
+}
 async function deleteJob(id) {
     if (!confirm('Удалить вакансию?')) return;
     const response = await apiFetch(`/api/jobs/${id}`, { method: 'DELETE' });

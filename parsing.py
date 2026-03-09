@@ -20,6 +20,20 @@ logger = logging.getLogger("parsing")
 
 STORAGE_DIR = Path(os.getenv("RESUME_STORAGE_DIR", "./storage_resumes"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/api/generate"))
+
+
+def _normalize_ollama_url(url: str) -> str:
+    url = (url or "").strip().rstrip("/")
+    if not url:
+        return "http://127.0.0.1:11434/api/generate"
+    if url.endswith("/api/generate"):
+        return url
+    if url.endswith("/api/chat") or url.endswith("/api/embeddings"):
+        return url
+    return f"{url}/api/generate"
+
+
+OLLAMA_URL = _normalize_ollama_url(OLLAMA_URL)
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:1.7b")
 OLLAMA_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "600"))
 OLLAMA_MAX_INPUT_CHARS = int(os.getenv("OLLAMA_MAX_INPUT_CHARS", "5000"))

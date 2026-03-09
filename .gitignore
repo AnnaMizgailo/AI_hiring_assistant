@@ -1,18 +1,51 @@
-__pycache__
-
-# Окружение и кэш
-venv/
-.venv/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 
-# Настройки PyCharm
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Database
+*.db
+*.sqlite3
+
+# Resume storage / uploads
+storage_resumes/
+uploads/
+tmp/
+temp/
+
+# Logs
+*.log
+
+# Test / cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
 .idea/
 
-# База данных и логи
-*.db
-*.log
-storage_resumes/
-
-# Системные файлы Mac
+# OS files
 .DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Misc
+*.swp
+*.swo

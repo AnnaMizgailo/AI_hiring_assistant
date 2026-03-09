@@ -11,7 +11,7 @@ DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:1.7b")
 DEFAULT_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/api/generate")
 
 
-def ollama_generate(model: str, prompt: str, temperature: float = 0.1) -> str:
+def ollama_generate(model: str, prompt: str, temperature: float = 0.15) -> str:
     payload = {
         "model": model,
         "prompt": prompt,
@@ -29,125 +29,104 @@ def safe_json_loads(text: str) -> Dict[str, Any]:
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
-        return json.loads(text[start:end + 1])
+        candidate = text[start:end + 1]
+        return json.loads(candidate)
     return json.loads(text)
 
 
-def _render_list(items: List[str]) -> str:
+def _render_group(title: str, items: List[str]) -> str:
     if not items:
-        return "- none"
-    return "\n".join([f"- {x}" for x in items])
+        return f"{title}:\n- none"
+    return title + ":\n" + "\n".join([f"- {x}" for x in items])
 
 
 def build_scoring_prompt(
     job_title: str,
-    deterministic_facts: Dict[str, Any],
+    job_description: str,
+    requirement_groups: Dict[str, List[str]],
     evidence_chunks: List[Dict[str, Any]],
-    max_abs_adjustment: int,
 ) -> str:
-    must_have = deterministic_facts.get("must_have", []) or []
-    nice_to_have = deterministic_facts.get("nice_to_have", []) or []
-    must_hits = deterministic_facts.get("must_hits", []) or []
-    must_missing = deterministic_facts.get("must_missing", []) or []
-    nice_hits = deterministic_facts.get("nice_hits", []) or []
-    nice_missing = deterministic_facts.get("nice_missing", []) or []
-    other_hits = deterministic_facts.get("other_hits", []) or []
-    other_missing = deterministic_facts.get("other_missing", []) or []
-    deterministic_score = int(deterministic_facts.get("deterministic_score") or 0)
-    keyword_coverage_percent = float(deterministic_facts.get("keyword_coverage_percent") or 0.0)
+    must_have = requirement_groups.get("must_have", []) or []
+    nice_to_have = requirement_groups.get("nice_to_have", []) or []
+    other = requirement_groups.get("other", []) or []
+    all_requirements = requirement_groups.get("all", []) or []
 
-    evidence = []
-    for i, item in enumerate(evidence_chunks[:6], start=1):
-        evidence.append(
-            f"Evidence {i}:\n"
-            f"text: {clean_text(str(item.get('text') or ''))}\n"
-            f"query: {clean_text(str(item.get('query') or ''))}\n"
-            f"score: {float(item.get('score') or 0.0):.3f}"
-        )
-    evidence_block = "\n\n".join(evidence) if evidence else "No evidence"
+    evidence_block = "\n\n".join(
+        [
+            f"EVIDENCE {i + 1} | similarity={float(ch.get('score') or 0.0):.3f} | query={clean_text(str(ch.get('query') or ''))}\n{clean_text(str(ch.get('text') or ''))}"
+            for i, ch in enumerate(evidence_chunks[:8])
+            if clean_text(str(ch.get("text") or ""))
+        ]
+    ) or "No evidence retrieved"
+
+    allowed_requirements = "\n".join([f"- {x}" for x in all_requirements]) if all_requirements else "- none"
 
     return f"""
-You explain resume scoring.
+You are an expert ATS reviewer.
 
-You are NOT the primary scorer.
-The deterministic scorer is the source of truth for matched and missing requirements.
+TASK:
+Review retrieved resume evidence for one candidate and one job.
 
-Your job:
-1. Write a short factual rationale using the deterministic facts and evidence.
-2. Suggest a small integer score_adjustment between {-max_abs_adjustment} and {max_abs_adjustment}.
-3. Optionally highlight a subset of the already-missing requirements.
+IMPORTANT:
+- You are not the primary scoring engine.
+- A deterministic scorer already computed the base score.
+- Your job is only to:
+  1) write a short grounded rationale
+  2) suggest missing requirements from the allowed list only
+  3) suggest a small score_adjustment between -10 and 10
+  4) choose the evidence snippets that best support your reasoning
 
-Rules:
-- Do not say a must-have requirement is met if it appears in MUST_HAVE_MISSING.
-- Do not invent skills.
-- Use only the evidence and facts below.
-- If deterministic facts say must-have coverage is weak, do not write that all must-have requirements are met.
-- focus_missing must be a subset of ALL_MISSING.
-- Return valid JSON only.
+RULES:
+- Use only the evidence below.
+- Do not invent skills or experience.
+- Do not copy the prompt wrapper into evidence text.
+- Do not use one-word snippets like B1, Docker, REST as evidence.
+- Keep score_adjustment close to 0 unless the evidence is clearly much better or much worse than the base score would imply.
+- Output valid JSON only.
 
-JOB_TITLE:
+JOB TITLE:
 {clean_text(job_title)}
 
-MUST_HAVE:
-{_render_list(must_have)}
+JOB DESCRIPTION:
+{clean_text(job_description)[:1800]}
 
-NICE_TO_HAVE:
-{_render_list(nice_to_have)}
+{_render_group("MUST_HAVE", must_have)}
 
-MUST_HAVE_HITS:
-{_render_list(must_hits)}
+{_render_group("NICE_TO_HAVE", nice_to_have)}
 
-MUST_HAVE_MISSING:
-{_render_list(must_missing)}
+{_render_group("OTHER_REQUIREMENTS", other)}
 
-NICE_TO_HAVE_HITS:
-{_render_list(nice_hits)}
+ALLOWED ITEMS FOR missing_requirements:
+{allowed_requirements}
 
-NICE_TO_HAVE_MISSING:
-{_render_list(nice_missing)}
-
-OTHER_HITS:
-{_render_list(other_hits)}
-
-OTHER_MISSING:
-{_render_list(other_missing)}
-
-ALL_MISSING:
-{_render_list((must_missing + nice_missing + other_missing))}
-
-DETERMINISTIC_SCORE:
-{deterministic_score}
-
-KEYWORD_COVERAGE_PERCENT:
-{keyword_coverage_percent}
-
-EVIDENCE:
+RETRIEVED RESUME EVIDENCE:
 {evidence_block}
 
-Return JSON:
+OUTPUT JSON SCHEMA:
 {{
   "rationale": "string",
+  "missing_requirements": ["string"],
   "score_adjustment": 0,
-  "focus_missing": ["string"]
+  "evidence_indices": [1, 2]
 }}
 """.strip()
 
 
 def llm_score_application(
     job_title: str,
-    deterministic_facts: Dict[str, Any],
+    job_description: str,
+    requirement_groups: Dict[str, List[str]],
     evidence_chunks: List[Dict[str, Any]],
     model: Optional[str] = None,
-    max_abs_adjustment: int = 5,
 ) -> Optional[Dict[str, Any]]:
     prompt = build_scoring_prompt(
         job_title=job_title,
-        deterministic_facts=deterministic_facts,
+        job_description=job_description,
+        requirement_groups=requirement_groups,
         evidence_chunks=evidence_chunks,
-        max_abs_adjustment=max_abs_adjustment,
     )
 
-    raw = ollama_generate(model=model or DEFAULT_MODEL, prompt=prompt, temperature=0.1)
+    raw = ollama_generate(model=model or DEFAULT_MODEL, prompt=prompt, temperature=0.15)
 
     try:
         data = safe_json_loads(raw)
@@ -158,26 +137,40 @@ def llm_score_application(
         return None
 
     rationale = clean_text(str(data.get("rationale") or ""))
-    focus_missing = data.get("focus_missing") or []
-    score_adjustment = data.get("score_adjustment", 0)
+    missing_requirements = data.get("missing_requirements") or []
+    evidence_indices = data.get("evidence_indices") or []
 
     try:
-        score_adjustment = int(score_adjustment)
+        score_adjustment = int(data.get("score_adjustment", 0))
     except Exception:
         score_adjustment = 0
 
-    score_adjustment = max(-max_abs_adjustment, min(max_abs_adjustment, score_adjustment))
+    score_adjustment = max(-10, min(10, score_adjustment))
 
-    if not isinstance(focus_missing, list):
-        focus_missing = []
+    if not isinstance(missing_requirements, list):
+        missing_requirements = []
+    if not isinstance(evidence_indices, list):
+        evidence_indices = []
 
-    focus_missing = [clean_text(str(x or "")) for x in focus_missing if clean_text(str(x or ""))]
+    normalized_missing = [clean_text(str(x)) for x in missing_requirements if clean_text(str(x))]
+
+    normalized_indices: List[int] = []
+    for idx in evidence_indices:
+        try:
+            iv = int(idx)
+        except Exception:
+            continue
+        if iv < 1 or iv > len(evidence_chunks):
+            continue
+        if iv not in normalized_indices:
+            normalized_indices.append(iv)
 
     if not rationale:
         return None
 
     return {
         "rationale": rationale,
+        "missing_requirements": normalized_missing,
         "score_adjustment": score_adjustment,
-        "focus_missing": focus_missing,
+        "evidence_indices": normalized_indices,
     }

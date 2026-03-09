@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+sqlalchemy
+aiosqlite
+jinja2
+python-multipart
+httpx
+requests
+python-dotenv
+aiogram>=3.0
+numpy
+scikit-learn
+PyMuPDF
+pdfplumber
+python-docx
