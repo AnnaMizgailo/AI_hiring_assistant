@@ -150,7 +150,6 @@ h1 {
 }
 
 h1::before {
-    content: "🧸";
     position: absolute;
     left: -30px;
     top: 0;
@@ -159,7 +158,6 @@ h1::before {
 }
 
 h1::after {
-    content: "🧸";
     position: absolute;
     right: -30px;
     top: 0;
