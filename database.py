@@ -122,6 +122,18 @@ class RagRun(Base):
     prompt_version = Column(String)
     model_version = Column(String)
     created_at = Column(DateTime, default=utcnow)
+    
+class Recruiter(Base):
+    __tablename__ = "recruiters"
+
+    id = Column(String, primary_key=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=True)  # может быть NULL для Google-пользователей
+    google_id = Column(String, unique=True, nullable=True)
+    full_name = Column(String, nullable=True)
+    avatar_url = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 async def init_db():

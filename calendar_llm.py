@@ -67,7 +67,7 @@ async def _ollama_generate(prompt: str, system: str = "") -> str:
 
 async def get_google_oauth_url(db: AsyncSession, recruiter_id: str) -> str:
     client_id = os.getenv("GOOGLE_CLIENT_ID", "demo-google-client-id")
-    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "http://127.0.0.1:8000/api/google/callback")
+    redirect_uri = os.getenv("GOOGLE_CALENDAR_REDIRECT_URI", "http://127.0.0.1:8000/api/google/callback")
     scope = os.getenv(
         "GOOGLE_SCOPES",
         "https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/calendar.events",
@@ -148,7 +148,7 @@ async def handle_google_callback(db: AsyncSession, recruiter_id: str, code: str)
         "code": code,
         "client_id": os.getenv("GOOGLE_CLIENT_ID"),
         "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
-        "redirect_uri": os.getenv("GOOGLE_REDIRECT_URI", "http://127.0.0.1:8000/api/google/callback"),
+        "redirect_uri": os.getenv("GOOGLE_CALENDAR_REDIRECT_URI", "http://127.0.0.1:8000/api/google/callback"),
         "grant_type": "authorization_code",
     }
     async with httpx.AsyncClient(timeout=60) as client:
