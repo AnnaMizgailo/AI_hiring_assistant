@@ -4,43 +4,87 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>HR Ассистент</title>
-    <link rel="stylesheet" href="/static/style.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
     <div class="container">
         <div class="navbar">
-            <a href="/jobs">Вакансии</a>
-            <a href="/jobs/new">Новая вакансия</a>
-            <a href="/integrations">Google Calendar</a>
-            <a href="/">Сменить рекрутера</a>
+            <a href="/jobs"><i class="fas fa-briefcase"></i> Вакансии</a>
+            <a href="/jobs/new"><i class="fas fa-plus-circle"></i> Новая вакансия</a>
+            <a href="/integrations"><i class="fab fa-google"></i> Google Calendar</a>
+            <div style="flex: 1;"></div>
+            <div id="userProfile" style="display: none; align-items: center; gap: 0.5rem; margin-right: 1rem;">
+                <img id="userAvatar" src="" alt="avatar" style="width: 32px; height: 32px; border-radius: 50%; border: 2px solid white; display: none;">
+                <span id="userName" style="color: white; font-weight: 500;"></span>
+            </div>
+            <a href="#" id="logoutBtn"><i class="fas fa-sign-out-alt"></i> Выйти</a>
         </div>
         {% block content %}{% endblock %}
     </div>
+
     <script>
-        function getRecruiterId() {
-            return localStorage.getItem('recruiter_id');
+        function getToken() {
+            return localStorage.getItem('access_token');
+        }
+
+        function getUserInfo() {
+            return {
+                id: localStorage.getItem('recruiter_id'),
+                email: localStorage.getItem('recruiter_email'),
+                name: localStorage.getItem('recruiter_name'),
+                avatar: localStorage.getItem('recruiter_avatar')
+            };
+        }
+
+        // Отображение профиля пользователя
+        function displayUserProfile() {
+            const user = getUserInfo();
+            const profileDiv = document.getElementById('userProfile');
+            const userNameSpan = document.getElementById('userName');
+            const userAvatar = document.getElementById('userAvatar');
+            
+            if (user.name || user.email) {
+                profileDiv.style.display = 'flex';
+                userNameSpan.textContent = user.name || user.email.split('@')[0];
+                if (user.avatar) {
+                    userAvatar.src = user.avatar;
+                    userAvatar.style.display = 'inline-block';
+                }
+            }
         }
 
         async function apiFetch(url, options = {}) {
-            const recruiterId = getRecruiterId();
-            if (!recruiterId) {
+            const token = getToken();
+            if (!token) {
                 window.location.href = '/';
                 return;
             }
             options.headers = {
                 ...options.headers,
-                'X-Recruiter-ID': recruiterId,
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
             };
-            if (!(options.body instanceof FormData)) {
-                options.headers['Content-Type'] = 'application/json';
-            }
             const response = await fetch(url, options);
-            if (response.status === 401 || response.status === 403) {
-                alert('Ошибка авторизации. Перенаправление...');
+            if (response.status === 401) {
+                alert('Сессия истекла. Пожалуйста, войдите снова.');
+                localStorage.clear();
                 window.location.href = '/';
             }
             return response;
+        }
+
+        document.getElementById('logoutBtn')?.addEventListener('click', function(e) {
+            e.preventDefault();
+            localStorage.clear();
+            window.location.href = '/';
+        });
+
+        // Вызываем при загрузке страницы, если мы не на странице входа
+        if (!window.location.pathname.startsWith('/') || window.location.pathname === '/') {
+            // На странице входа не показываем профиль
+        } else {
+            displayUserProfile();
         }
     </script>
     {% block scripts %}{% endblock %}

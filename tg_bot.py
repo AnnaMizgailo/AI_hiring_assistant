@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import logging
 import sys
 import secrets
 from typing import Any, Dict, Optional, List
@@ -33,368 +34,86 @@ load_dotenv(dotenv_path=env_path)
 
 API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-RECRUITER_ID = os.getenv("RECRUITER_ID", "test_recruiter")
 
-logger.info(f"Starting bot with API_BASE={API_BASE}")
-logger.info(f"RECRUITER_ID={RECRUITER_ID}")
-logger.info(f"BOT_TOKEN={'set' if BOT_TOKEN else 'not set'}")
-sys.stdout.flush()
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is empty. Проверьте .env файл")
 
-# Хранилище для данных кнопок
-callback_data_store = {}
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def generate_short_id() -> str:
-    """Генерирует короткий ID (8 символов)"""
-    return secrets.token_hex(4)
 
-# Состояния FSM
-class ApplicationStates(StatesGroup):
-    waiting_for_resume = State()
-    waiting_for_salary = State()
-    waiting_for_work_format = State()
-    waiting_for_reason = State()
-    waiting_for_english = State()
-    booking_slot = State()
+class CandidateFlow(StatesGroup):
+    SELECTING_JOB = State()
+    WAITING_RESUME = State()
+    ASK_SALARY = State()
+    ASK_WORK_FORMAT = State()
+    ASK_REASON = State()
+    ASK_ENGLISH = State()
+    WAITING_SLOT = State()
+    FINISHED = State()
 
-# API функции
-async def api_create_application(job_id: str, telegram_user_id: int, telegram_username: Optional[str]) -> Dict[str, Any]:
-    """Создание отклика на вакансию"""
-    logger.info(f"Creating application for job {job_id}, user {telegram_user_id}")
-    sys.stdout.flush()
-    
-    payload = {
-        "job_id": job_id,
-        "telegram_user_id": telegram_user_id,
-        "telegram_username": telegram_username
-    }
-    
+
+async def api_call(
+    method: str,
+    endpoint: str,
+    json_data: Optional[Dict] = None,
+    files: Optional[Dict] = None,
+    params: Optional[Dict] = None,
+) -> Dict:
+    url = f"{API_BASE}{endpoint}"
+    headers = {}  # никаких заголовков аутентификации по умолчанию
+
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        if method.upper() == "GET":
+            r = await client.get(url, headers=headers, params=params)
+        elif method.upper() == "POST":
+            if files:
+                # Для загрузки файлов нужно отправлять multipart, headers не нужны
+                r = await client.post(url, files=files, data=json_data or {}, params=params)
+            else:
+                r = await client.post(url, headers=headers, json=json_data, params=params)
+        elif method.upper() == "PATCH":
+            r = await client.patch(url, headers=headers, json=json_data, params=params)
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+
+        r.raise_for_status()
+        return r.json()
+
+
+async def wait_for_document_parsing(document_id: str, timeout_seconds: int = 600, poll_interval: float = 3.0) -> Dict[str, Any]:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    last_status = None
+
+    while asyncio.get_running_loop().time() < deadline:
+        status = await api_call("GET", f"/api/documents/{document_id}")
+        parse_status = (status.get("parse_status") or "").upper()
+        last_status = status
+
+        if parse_status == "DONE":
+            return status
+        if parse_status == "ERROR":
+            message = status.get("last_error") or "Не удалось обработать резюме."
+            raise RuntimeError(message)
+
+        await asyncio.sleep(poll_interval)
+
+    raise TimeoutError(f"Парсинг резюме не завершился за {timeout_seconds} секунд. Последний статус: {last_status}")
+
+
+async def load_jobs_for_candidate() -> List[Dict[str, Any]]:
+    """Получает список всех вакансий через публичный эндпоинт."""
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            url = f"{API_BASE}/api/applications"
-            logger.info(f"POST to {url}")
-            sys.stdout.flush()
-            
-            r = await client.post(url, json=payload)
-            logger.info(f"Response status: {r.status_code}")
-            sys.stdout.flush()
-            
-            r.raise_for_status()
-            result = r.json()
-            logger.info(f"Response: {result}")
-            sys.stdout.flush()
-            return result
+        jobs = await api_call("GET", "/api/public/jobs")
+        if isinstance(jobs, list):
+            return jobs
+        logger.warning(f"Unexpected response from public jobs: {jobs}")
     except Exception as e:
-        logger.error(f"Error creating application: {e}", exc_info=True)
-        sys.stdout.flush()
-        raise
+        logger.exception("Failed to load public jobs")
+    return []
 
-async def api_list_jobs() -> List[dict]:
-    """Получение списка вакансий"""
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            headers = {"X-Recruiter-ID": RECRUITER_ID}
-            url = f"{API_BASE}/api/jobs"
-            logger.info(f"GET to {url}")
-            sys.stdout.flush()
-            
-            r = await client.get(url, headers=headers)
-            logger.info(f"Response status: {r.status_code}")
-            sys.stdout.flush()
-            
-            r.raise_for_status()
-            result = r.json()
-            logger.info(f"Found {len(result)} jobs")
-            sys.stdout.flush()
-            return result
-    except Exception as e:
-        logger.error(f"Error listing jobs: {e}", exc_info=True)
-        sys.stdout.flush()
-        return []
 
-async def api_get_job_details(job_id: str) -> Dict[str, Any]:
-    """Получение деталей вакансии"""
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            headers = {"X-Recruiter-ID": RECRUITER_ID}
-            url = f"{API_BASE}/api/jobs/{job_id}"
-            logger.info(f"GET to {url}")
-            sys.stdout.flush()
-            
-            r = await client.get(url, headers=headers)
-            logger.info(f"Response status: {r.status_code}")
-            sys.stdout.flush()
-            
-            r.raise_for_status()
-            result = r.json()
-            logger.info(f"Got details for job: {result.get('title', 'Unknown')}")
-            sys.stdout.flush()
-            return result
-    except Exception as e:
-        logger.error(f"Error getting job details: {e}", exc_info=True)
-        sys.stdout.flush()
-        return {}
-
-async def api_upload_document(candidate_id: str, file_bytes: bytes, filename: str) -> Dict[str, str]:
-    """Загрузка документа кандидата"""
-    logger.info(f"Uploading document for candidate {candidate_id}, filename: {filename}")
-    logger.info(f"File size: {len(file_bytes)} bytes")
-    sys.stdout.flush()
-    
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            url = f"{API_BASE}/api/candidates/{candidate_id}/documents"
-            logger.info(f"POST to {url}")
-            sys.stdout.flush()
-            
-            files = {'file': (filename, file_bytes, 'application/octet-stream')}
-            r = await client.post(url, files=files)
-            
-            logger.info(f"Upload response status: {r.status_code}")
-            logger.info(f"Upload response headers: {dict(r.headers)}")
-            sys.stdout.flush()
-            
-            try:
-                response_text = r.text
-                logger.info(f"Upload response body: {response_text[:500]}")
-                sys.stdout.flush()
-            except:
-                pass
-            
-            r.raise_for_status()
-            result = r.json()
-            logger.info(f"Upload successful: {result}")
-            sys.stdout.flush()
-            return result
-            
-    except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP error uploading document: {e.response.status_code}")
-        logger.error(f"Response: {e.response.text}")
-        sys.stdout.flush()
-        raise Exception(f"Server error: {e.response.status_code}")
-    except Exception as e:
-        logger.error(f"Error uploading document: {e}", exc_info=True)
-        sys.stdout.flush()
-        raise
-
-async def api_run_parsing(document_id: str) -> Dict[str, Any]:
-    """Запуск парсинга документа"""
-    logger.info("=" * 50)
-    logger.info("START PARSING REQUEST")
-    logger.info(f"Document ID: {document_id}")
-    logger.info("=" * 50)
-    sys.stdout.flush()
-    
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            url = f"{API_BASE}/api/parsing/run"
-            payload = {"document_id": document_id}
-            
-            logger.info(f"URL: {url}")
-            logger.info(f"Payload: {payload}")
-            sys.stdout.flush()
-            
-            r = await client.post(url, json=payload)
-            
-            logger.info(f"Response status: {r.status_code}")
-            logger.info(f"Response headers: {dict(r.headers)}")
-            sys.stdout.flush()
-            
-            try:
-                response_text = r.text
-                logger.info(f"Response text length: {len(response_text)}")
-                logger.info(f"Response text preview: {response_text[:500]}")
-                sys.stdout.flush()
-            except Exception as e:
-                logger.error(f"Could not get response text: {e}")
-                sys.stdout.flush()
-            
-            if r.status_code != 200:
-                error_message = f"HTTP {r.status_code}"
-                
-                try:
-                    error_json = r.json()
-                    logger.info(f"Error JSON: {error_json}")
-                    sys.stdout.flush()
-                    if isinstance(error_json, dict):
-                        if "detail" in error_json:
-                            error_message = error_json["detail"]
-                        elif "message" in error_json:
-                            error_message = error_json["message"]
-                        elif "error" in error_json:
-                            error_message = error_json["error"]
-                except:
-                    if response_text and len(response_text) < 500:
-                        error_message = response_text
-                
-                logger.error(f"Parsing failed: {error_message}")
-                sys.stdout.flush()
-                return {"status": "ERROR", "error": error_message}
-            
-            try:
-                result = r.json()
-                logger.info(f"Success response: {result}")
-                logger.info("=" * 50)
-                logger.info("PARSING SUCCESS")
-                logger.info("=" * 50)
-                sys.stdout.flush()
-                return result
-            except Exception as e:
-                logger.error(f"Could not parse success response as JSON: {e}")
-                logger.error(f"Raw response: {response_text}")
-                sys.stdout.flush()
-                return {"status": "ERROR", "error": f"Invalid JSON response: {str(e)}"}
-            
-    except httpx.TimeoutException as e:
-        logger.error(f"Timeout error: {e}")
-        sys.stdout.flush()
-        return {"status": "ERROR", "error": "Превышено время ожидания (более 2 минут)"}
-    except httpx.ConnectError as e:
-        logger.error(f"Connection error: {e}")
-        sys.stdout.flush()
-        return {"status": "ERROR", "error": f"Ошибка подключения к серверу: {str(e)}"}
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
-        sys.stdout.flush()
-        return {"status": "ERROR", "error": f"Неожиданная ошибка: {str(e)}"}
-
-async def api_run_scoring(application_id: str) -> Dict[str, Any]:
-    """Запуск скоринга отклика"""
-    logger.info(f"Running scoring for application {application_id}")
-    sys.stdout.flush()
-    
-    try:
-        async with httpx.AsyncClient(timeout=180) as client:
-            url = f"{API_BASE}/api/applications/{application_id}/score"
-            logger.info(f"POST to {url}")
-            sys.stdout.flush()
-            
-            r = await client.post(url)
-            logger.info(f"Response status: {r.status_code}")
-            sys.stdout.flush()
-            
-            r.raise_for_status()
-            result = r.json()
-            logger.info(f"Scoring result: {result}")
-            sys.stdout.flush()
-            return result
-    except Exception as e:
-        logger.error(f"Error running scoring: {e}", exc_info=True)
-        sys.stdout.flush()
-        raise
-
-async def api_save_screening_answers(application_id: str, answers: Dict[str, str]) -> None:
-    """Сохранение ответов на скрининговые вопросы"""
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            url = f"{API_BASE}/api/applications/{application_id}/screening-answers"
-            logger.info(f"PATCH to {url}")
-            
-            r = await client.patch(url, json=answers)
-            logger.info(f"Response status: {r.status_code}")
-            
-            r.raise_for_status()
-            
-    except Exception as e:
-        logger.error(f"Error saving screening answers: {e}", exc_info=True)
-        raise
-
-async def api_book_slot(application_id: str, slot_id: str) -> Dict[str, Any]:
-    """Бронирование слота для собеседования"""
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            url = f"{API_BASE}/api/applications/{application_id}/book-slot"
-            logger.info(f"POST to {url}")
-            sys.stdout.flush()
-            
-            r = await client.post(url, json={"slot_id": slot_id})
-            logger.info(f"Response status: {r.status_code}")
-            sys.stdout.flush()
-            
-            r.raise_for_status()
-            return r.json()
-    except Exception as e:
-        logger.error(f"Error booking slot: {e}", exc_info=True)
-        sys.stdout.flush()
-        raise
-
-async def api_get_available_slots(job_id: str) -> List[Dict[str, Any]]:
-    """Получение доступных слотов для собеседования"""
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            headers = {"X-Recruiter-ID": RECRUITER_ID}
-            url = f"{API_BASE}/api/jobs/{job_id}/slots"
-            logger.info(f"POST to {url}")
-            
-            r = await client.post(url, headers=headers)
-            logger.info(f"Response status: {r.status_code}")
-            
-            r.raise_for_status()
-            response_data = r.json()
-            slots = response_data.get("slots", [])
-            logger.info(f"Received {len(slots)} slots")
-            
-            return slots
-            
-    except Exception as e:
-        logger.error(f"Error getting slots: {e}", exc_info=True)
-        sys.stdout.flush()
-        return []
-
-async def check_api_health() -> Dict[str, Any]:
-    """Проверка здоровья API"""
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(f"{API_BASE}/docs")
-            if r.status_code == 200:
-                headers = {"X-Recruiter-ID": RECRUITER_ID}
-                jobs_response = await client.get(f"{API_BASE}/api/jobs", headers=headers)
-                
-                if jobs_response.status_code == 200:
-                    return {
-                        "status": "ok", 
-                        "message": f"API работает. Найдено вакансий: {len(jobs_response.json())}"
-                    }
-                else:
-                    return {
-                        "status": "warning", 
-                        "message": f"Сервер доступен, но аутентификация не прошла. Статус: {jobs_response.status_code}"
-                    }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-    return {"status": "unknown", "message": "Could not determine API status"}
-
-# Клавиатуры
-def main_menu_keyboard():
-    """Главное меню"""
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📋 Список вакансий", callback_data="list_jobs")
-    kb.button(text="ℹ️ Помощь", callback_data="help")
-    kb.adjust(1)
-    return kb.as_markup()
-
-def jobs_keyboard(jobs: List[dict]):
-    """Клавиатура со списком вакансий"""
-    kb = InlineKeyboardBuilder()
-    for j in jobs:
-        job_id = generate_short_id()
-        callback_data_store[job_id] = ("job", j["id"])
-        
-        kb.button(
-            text=f'{j["title"]} (порог {j["threshold_score"]})', 
-            callback_data=f"cb:{job_id}"
-        )
-    kb.button(text="◀️ Назад", callback_data="back_to_main")
-    kb.adjust(1)
-    return kb.as_markup()
-
-def back_keyboard():
-    """Клавиатура с кнопкой назад"""
-    kb = InlineKeyboardBuilder()
-    kb.button(text="◀️ Назад", callback_data="back_to_main")
-    return kb.as_markup()
-
-def slots_keyboard(slots: List[Dict[str, Any]], application_id: str):
-    """Клавиатура с доступными слотами"""
+def cancel_kb():
     kb = InlineKeyboardBuilder()
     
     for slot in slots:
@@ -615,50 +334,32 @@ async def run_bot() -> None:
         
         # Получаем данные из состояния
         data = await state.get_data()
-        candidate_id = data.get("candidate_id")
-        application_id = data.get("application_id")
-        job_title = data.get("job_title", "Неизвестно")
-        job_id = data.get("job_id")
-        
-        if not candidate_id or not application_id:
-            await message.answer(
-                "❌ Ошибка: данные отклика не найдены. Начните сначала с /start"
-            )
-            await state.clear()
-            return
-        
-        status_msg = await message.answer("📥 Получил файл. Начинаю обработку...")
-        
+        candidate_id = data["candidate_id"]
+
         try:
-            # Скачиваем файл
-            file_info = await message.bot.get_file(document.file_id)
-            file_bytes = await message.bot.download_file(file_info.file_path)
-            file_bytes = file_bytes.read()
-            logger.info(f"File downloaded: {document.file_name}, size: {len(file_bytes)} bytes")
-            
-            # Загружаем документ на сервер
-            doc_result = await api_upload_document(
-                candidate_id, 
-                file_bytes, 
-                document.file_name
-            )
-            document_id = doc_result["document_id"]
-            
-            await status_msg.edit_text("🔄 Анализирую резюме...")
-            
-            # Запускаем парсинг
-            parse_result = await api_run_parsing(document_id)
-            
-            if parse_result.get("status") == "ERROR":
-                error_msg = parse_result.get('error', 'Неизвестная ошибка')
-                
-                if "Ollama" in error_msg or "connection" in error_msg.lower():
-                    await status_msg.edit_text(
-                        "❌ Ошибка подключения к Ollama. Убедитесь, что Ollama запущен."
-                    )
-                else:
-                    await status_msg.edit_text(f"❌ Ошибка при анализе резюме")
-                await state.clear()
+            file_info = await bot.get_file(doc.file_id)
+            file_bytes = await bot.download_file(file_info.file_path)
+
+            files = {
+                "file": (
+                    doc.file_name or "resume.pdf",
+                    file_bytes.getvalue(),
+                    doc.mime_type,
+                )
+            }
+
+            upload_res = await api_call("POST", f"/api/candidates/{candidate_id}/documents", files=files)
+            document_id = upload_res["document_id"]
+            await state.update_data(document_id=document_id)
+
+            await api_call("POST", "/api/parsing/run", json_data={"document_id": document_id})
+
+            await m.answer("Резюме загружено. Начинаю обработку, это может занять до нескольких минут...")
+
+            try:
+                await wait_for_document_parsing(document_id, timeout_seconds=600, poll_interval=3.0)
+            except TimeoutError:
+                await m.answer("Резюме ещё обрабатывается слишком долго. Попробуйте немного позже.")
                 return
             
             elif parse_result.get("status") == "STARTED":

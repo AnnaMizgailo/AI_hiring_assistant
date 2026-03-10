@@ -348,7 +348,6 @@ curl http://127.0.0.1:11434/api/tags
 ```env
 BOT_TOKEN=PASTE_YOUR_TELEGRAM_BOT_TOKEN_HERE
 API_BASE=http://127.0.0.1:8000
-RECRUITER_ID=demo-recruiter
 
 OLLAMA_BASE_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=qwen3:1.7b
@@ -487,12 +486,14 @@ http://127.0.0.1:8000/api/google/callback
 
 ```text
 http://127.0.0.1:8000/api/google/callback
+http://127.0.0.1:8000/api/auth/google/callback
 ```
 
 Если планируете запуск с `localhost`, можно добавить и второй вариант:
 
 ```text
 http://localhost:8000/api/google/callback
+http://localhost:8000/api/auth/google/callback
 ```
 
 6. Нажмите **Create**.

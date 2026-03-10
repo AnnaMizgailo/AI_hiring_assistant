@@ -9,13 +9,50 @@ from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 import os
 import uuid
-import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+from authlib.integrations.starlette_client import OAuth
+from starlette.config import Config
+from starlette.middleware.sessions import SessionMiddleware
+from pydantic import EmailStr
+import logging
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# Конфигурация JWT
+# Захардкоженный ключ для локального прототипа
+SECRET_KEY = "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Настройка Google OAuth (для входа, а не для календаря)
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_AUTH_REDIRECT_URI = os.getenv("GOOGLE_AUTH_REDIRECT_URI", "http://127.0.0.1:8000/api/auth/google/callback")
+
+config_data = {
+    "GOOGLE_CLIENT_ID": GOOGLE_CLIENT_ID,
+    "GOOGLE_CLIENT_SECRET": GOOGLE_CLIENT_SECRET
+}
+starlette_config = Config(environ=config_data)
+oauth = OAuth(starlette_config)
+oauth.register(
+    name='google',
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={'scope': 'openid email profile'},
+)
+
+
 
 from database import (
     init_db, get_db, Job, Candidate, Application, Document,
-    Profile, RecruiterGoogle, Slot, RagRun
+    Profile, RecruiterGoogle, Slot, RagRun, Recruiter
 )
 from parsing import parse_document
 from scoring_rag import score_application
@@ -106,6 +143,22 @@ class GoogleCallbackOut(BaseModel):
 class ParsingRunIn(BaseModel):
     document_id: str
 
+class RecruiterRegister(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=6)
+    full_name: Optional[str] = None
+
+class RecruiterLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+    recruiter_id: str
+    email: str
+    full_name: Optional[str]
+
 
 class ScreeningAnswersIn(BaseModel):
     salary_expectation: Optional[str] = None
@@ -116,6 +169,9 @@ class ScreeningAnswersIn(BaseModel):
 
 # === Приложение FastAPI ===
 app = FastAPI(title="HR Assistant Prototype")
+
+# Middleware для сессий (нужен для OAuth)
+app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
 
 # Подключаем статику и шаблоны
 templates = Jinja2Templates(directory="templates")
@@ -128,12 +184,68 @@ async def startup_event():
 
 
 def now_iso() -> str:
-    return datetime.datetime.utcnow().isoformat() + "Z"
+    return datetime.utcnow().isoformat() + "Z"
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
 
-async def get_current_recruiter(recruiter_id: Optional[str] = Header(None, alias="X-Recruiter-ID")):
-    if not recruiter_id:
-        raise HTTPException(status_code=401, detail="Missing recruiter ID")
+async def get_current_recruiter(
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    x_recruiter_id: Optional[str] = Header(None, alias="X-Recruiter-ID"),
+    db: AsyncSession = Depends(get_db)
+) -> str:
+    """
+    Извлекает ID рекрутера из:
+    - JWT токена (Bearer) в заголовке Authorization (для веб-интерфейса)
+    - или из заголовка X-Recruiter-ID (для обратной совместимости с ботом)
+    """
+    # Если используется старый заголовок (для бота)
+    if x_recruiter_id:
+        return x_recruiter_id
+
+    # Иначе проверяем JWT
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    if not authorization:
+        raise credentials_exception
+    try:
+        scheme, token = authorization.split()
+        if scheme.lower() != "bearer":
+            raise credentials_exception
+    except ValueError:
+        raise credentials_exception
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        recruiter_id: str = payload.get("sub")
+        if recruiter_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    # Опционально: проверить, что рекрутер существует в БД
+    result = await db.execute(select(Recruiter).where(Recruiter.id == recruiter_id))
+    recruiter = result.scalar_one_or_none()
+    if not recruiter:
+        raise credentials_exception
+
     return recruiter_id
 
 
@@ -151,8 +263,8 @@ async def create_job(
         threshold_score=payload.threshold_score,
         requirements_json=payload.requirements_json or {},
         recruiter_id=recruiter,
-        created_at=datetime.datetime.utcnow(),
-        updated_at=datetime.datetime.utcnow()
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow()
     )
     db.add(job)
     await db.commit()
@@ -230,7 +342,7 @@ async def update_job(
     for key, value in update_data.items():
         if hasattr(job, key):
             setattr(job, key, value)
-    job.updated_at = datetime.datetime.utcnow()
+    job.updated_at = datetime.utcnow()
 
     await db.commit()
     return {"job_id": job_id, "status": "updated"}
@@ -270,7 +382,7 @@ async def create_application(
             id=candidate_id,
             telegram_user_id=payload.telegram_user_id,
             telegram_username=payload.telegram_username,
-            created_at=datetime.datetime.utcnow()
+            created_at=datetime.utcnow()
         )
         db.add(candidate)
         await db.flush()
@@ -283,8 +395,8 @@ async def create_application(
         job_id=payload.job_id,
         candidate_id=candidate_id,
         status="NEW",
-        created_at=datetime.datetime.utcnow(),
-        updated_at=datetime.datetime.utcnow()
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow()
     )
     db.add(app_obj)
     await db.commit()
@@ -435,7 +547,7 @@ async def update_screening_answers(
         "reason": payload.reason,
         "english_level": payload.english_level,
     }
-    app_obj.updated_at = datetime.datetime.utcnow()
+    app_obj.updated_at = datetime.utcnow()
     await db.commit()
     return {"status": "ok", "application_id": application_id}
 
@@ -632,3 +744,187 @@ async def edit_job_page(request: Request, job_id: str, db: AsyncSession = Depend
 @app.get("/jobs/{job_id}/applications", response_class=HTMLResponse)
 async def applications_page(request: Request, job_id: str):
     return templates.TemplateResponse("applications.html", {"request": request, "job_id": job_id})
+
+@app.post("/api/auth/register", response_model=TokenResponse)
+async def register(recruiter: RecruiterRegister, db: AsyncSession = Depends(get_db)):
+    # Проверяем, не занят ли email
+    result = await db.execute(select(Recruiter).where(Recruiter.email == recruiter.email))
+    if result.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    # Создаём нового рекрутера
+    recruiter_id = str(uuid.uuid4())
+    hashed_password = get_password_hash(recruiter.password)
+    db_recruiter = Recruiter(
+        id=recruiter_id,
+        email=recruiter.email,
+        hashed_password=hashed_password,
+        full_name=recruiter.full_name,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow()
+    )
+    db.add(db_recruiter)
+    await db.commit()
+
+    # Создаём токен
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": recruiter_id}, expires_delta=access_token_expires
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "recruiter_id": recruiter_id,
+        "email": recruiter.email,
+        "full_name": recruiter.full_name
+    }
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+async def login(login_data: RecruiterLogin, db: AsyncSession = Depends(get_db)):
+    # Ищем рекрутера по email
+    result = await db.execute(select(Recruiter).where(Recruiter.email == login_data.email))
+    recruiter = result.scalar_one_or_none()
+    if not recruiter or not verify_password(login_data.password, recruiter.hashed_password):
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+
+    # Создаём токен
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": recruiter.id}, expires_delta=access_token_expires
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "recruiter_id": recruiter.id,
+        "email": recruiter.email,
+        "full_name": recruiter.full_name
+    }
+
+    
+@app.get("/api/auth/google/login")
+async def google_login(request: Request):
+    # Теперь мы ссылаемся на УНИКАЛЬНОЕ имя функции
+    redirect_uri = request.url_for('auth_google_callback')
+    logger.info(f"Initiating Google Login. Redirect URI resolved to: {redirect_uri}")
+    return await oauth.google.authorize_redirect(request, redirect_uri)
+
+
+@app.get("/api/auth/google/callback")
+async def auth_google_callback(request: Request, db: AsyncSession = Depends(get_db)):
+    logger.info("Entered auth_google_callback endpoint")
+    try:
+        token = await oauth.google.authorize_access_token(request)
+        user_info = token.get('userinfo')
+        
+        if not user_info:
+            logger.error("Failed to get user_info from Google token")
+            raise HTTPException(status_code=400, detail="Could not get user info from Google")
+
+        email = user_info.get('email')
+        google_id = user_info.get('sub')
+        full_name = user_info.get('name')
+        avatar_url = user_info.get('picture')
+
+        logger.info(f"Successfully fetched Google user: {email} (ID: {google_id})")
+
+        if not email or not google_id:
+            logger.error(f"Missing essential fields: email={email}, sub={google_id}")
+            raise HTTPException(status_code=400, detail="Missing required user info from Google")
+
+        # Ищем существующего рекрутера по email или google_id
+        result = await db.execute(
+            select(Recruiter).where(
+                (Recruiter.email == email) | (Recruiter.google_id == google_id)
+            )
+        )
+        recruiter = result.scalar_one_or_none()
+
+        if recruiter:
+            logger.info(f"Found existing recruiter in DB: {recruiter.id}")
+            if not recruiter.google_id:
+                recruiter.google_id = google_id
+            if not recruiter.avatar_url and avatar_url:
+                recruiter.avatar_url = avatar_url
+            recruiter.updated_at = datetime.utcnow()
+        else:
+            logger.info("Creating new recruiter in DB")
+            recruiter_id = str(uuid.uuid4())
+            recruiter = Recruiter(
+                id=recruiter_id,
+                email=email,
+                google_id=google_id,
+                full_name=full_name,
+                avatar_url=avatar_url,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
+            )
+            db.add(recruiter)
+
+        await db.commit()
+        logger.info("DB commit successful")
+
+        # Создаём JWT токен
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": recruiter.id}, expires_delta=access_token_expires
+        )
+        logger.info(f"Generated JWT token for recruiter: {recruiter.id}")
+
+        return HTMLResponse(content=f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Вход выполнен</title>
+            <style>
+                body {{
+                    font-family: Arial, sans-serif;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    height: 100vh;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                }}
+                .message {{ text-align: center; }}
+            </style>
+        </head>
+        <body>
+            <div class="message">
+                <h1>✅ Вход выполнен успешно!</h1>
+                <p>Вы можете закрыть это окно и вернуться в приложение.</p>
+            </div>
+            <script>
+                if (window.opener) {{
+                    console.log("Sending message to opener...");
+                    window.opener.postMessage({{
+                        type: 'google-auth-success',
+                        token: '{access_token}',
+                        recruiter_id: '{recruiter.id}',
+                        email: '{email}',
+                        full_name: '{full_name or ""}'
+                    }}, '*');
+                    setTimeout(() => window.close(), 2000);
+                }} else {{
+                    console.log("No window.opener found. Cannot pass token automatically.");
+                }}
+            </script>
+        </body>
+        </html>
+        """)
+
+    except Exception as e:
+        logger.exception("Error occurred during Google Callback processing:")
+        return HTMLResponse(content=f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Ошибка входа</title>
+        </head>
+        <body>
+            <h1>Произошла ошибка при входе</h1>
+            <p>{str(e)}</p>
+        </body>
+        </html>
+        """)
