@@ -33,11 +33,10 @@ load_dotenv(dotenv_path=env_path)
 
 API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-# RECRUITER_ID = os.getenv("RECRUITER_ID", "test_recruiter")
-url = f"{API_BASE}/api/public/jobs"
+RECRUITER_ID = os.getenv("RECRUITER_ID", "test_recruiter")
 
 logger.info(f"Starting bot with API_BASE={API_BASE}")
-# logger.info(f"RECRUITER_ID={RECRUITER_ID}")
+logger.info(f"RECRUITER_ID={RECRUITER_ID}")
 logger.info(f"BOT_TOKEN={'set' if BOT_TOKEN else 'not set'}")
 sys.stdout.flush()
 
@@ -93,12 +92,12 @@ async def api_list_jobs() -> List[dict]:
     """Получение списка вакансий"""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            # headers = {"X-Recruiter-ID": RECRUITER_ID}
-            url = f"{API_BASE}/api/public/jobs"
+            headers = {"X-Recruiter-ID": RECRUITER_ID}
+            url = f"{API_BASE}/api/jobs"
             logger.info(f"GET to {url}")
             sys.stdout.flush()
             
-            r = await client.get(url)
+            r = await client.get(url, headers=headers)
             logger.info(f"Response status: {r.status_code}")
             sys.stdout.flush()
             
@@ -116,12 +115,12 @@ async def api_get_job_details(job_id: str) -> Dict[str, Any]:
     """Получение деталей вакансии"""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            # headers = {"X-Recruiter-ID": RECRUITER_ID}
+            headers = {"X-Recruiter-ID": RECRUITER_ID}
             url = f"{API_BASE}/api/jobs/{job_id}"
             logger.info(f"GET to {url}")
             sys.stdout.flush()
             
-            r = await client.get(url)
+            r = await client.get(url, headers=headers)
             logger.info(f"Response status: {r.status_code}")
             sys.stdout.flush()
             
@@ -322,11 +321,11 @@ async def api_get_available_slots(job_id: str) -> List[Dict[str, Any]]:
     """Получение доступных слотов для собеседования"""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            # headers = {"X-Recruiter-ID": RECRUITER_ID}
+            headers = {"X-Recruiter-ID": RECRUITER_ID}
             url = f"{API_BASE}/api/jobs/{job_id}/slots"
             logger.info(f"POST to {url}")
             
-            r = await client.post(url)
+            r = await client.post(url, headers=headers)
             logger.info(f"Response status: {r.status_code}")
             
             r.raise_for_status()
@@ -347,8 +346,8 @@ async def check_api_health() -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=5) as client:
             r = await client.get(f"{API_BASE}/docs")
             if r.status_code == 200:
-                # headers = {"X-Recruiter-ID": RECRUITER_ID}
-                jobs_response = await client.get(f"{API_BASE}/api/jobs")
+                headers = {"X-Recruiter-ID": RECRUITER_ID}
+                jobs_response = await client.get(f"{API_BASE}/api/jobs", headers=headers)
                 
                 if jobs_response.status_code == 200:
                     return {
