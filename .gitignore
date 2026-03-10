@@ -10,6 +10,7 @@ env/
 
 # Environment files
 .env
+.env.example
 .env.local
 .env.*.local
 
@@ -40,6 +41,7 @@ htmlcov/
 # OS files
 .DS_Store
 Thumbs.db
+.db
 
 # Build artifacts
 dist/
