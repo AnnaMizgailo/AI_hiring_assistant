@@ -1,5 +1,6 @@
 import os
 import asyncio
+import logging
 from typing import Dict, Optional, Any, List
 
 from dotenv import load_dotenv
@@ -16,10 +17,12 @@ import httpx
 
 API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-RECRUITER_ID = os.getenv("RECRUITER_ID", "demo-recruiter")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is empty. Проверьте .env файл")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class CandidateFlow(StatesGroup):
@@ -39,19 +42,17 @@ async def api_call(
     json_data: Optional[Dict] = None,
     files: Optional[Dict] = None,
     params: Optional[Dict] = None,
-    use_recruiter_header: bool = True,
 ) -> Dict:
     url = f"{API_BASE}{endpoint}"
-    headers = {}
-    if use_recruiter_header:
-        headers["X-Recruiter-ID"] = RECRUITER_ID
+    headers = {}  # никаких заголовков аутентификации по умолчанию
 
     async with httpx.AsyncClient(timeout=180.0) as client:
         if method.upper() == "GET":
             r = await client.get(url, headers=headers, params=params)
         elif method.upper() == "POST":
             if files:
-                r = await client.post(url, headers=headers, files=files, data=json_data or {}, params=params)
+                # Для загрузки файлов нужно отправлять multipart, headers не нужны
+                r = await client.post(url, files=files, data=json_data or {}, params=params)
             else:
                 r = await client.post(url, headers=headers, json=json_data, params=params)
         elif method.upper() == "PATCH":
@@ -63,14 +64,12 @@ async def api_call(
         return r.json()
 
 
-
-
 async def wait_for_document_parsing(document_id: str, timeout_seconds: int = 600, poll_interval: float = 3.0) -> Dict[str, Any]:
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     last_status = None
 
     while asyncio.get_running_loop().time() < deadline:
-        status = await api_call("GET", f"/api/documents/{document_id}", use_recruiter_header=False)
+        status = await api_call("GET", f"/api/documents/{document_id}")
         parse_status = (status.get("parse_status") or "").upper()
         last_status = status
 
@@ -86,19 +85,15 @@ async def wait_for_document_parsing(document_id: str, timeout_seconds: int = 600
 
 
 async def load_jobs_for_candidate() -> List[Dict[str, Any]]:
-    """
-    Сначала пытаемся получить публичный список вакансий для кандидата.
-    Если такого эндпойнта ещё нет, используем текущий recruiter-scoped /api/jobs.
-    """
+    """Получает список всех вакансий через публичный эндпоинт."""
     try:
-        jobs = await api_call("GET", "/api/public/jobs", use_recruiter_header=False)
+        jobs = await api_call("GET", "/api/public/jobs")
         if isinstance(jobs, list):
             return jobs
-    except Exception:
-        pass
-
-    jobs = await api_call("GET", "/api/jobs", use_recruiter_header=True)
-    return jobs if isinstance(jobs, list) else []
+        logger.warning(f"Unexpected response from public jobs: {jobs}")
+    except Exception as e:
+        logger.exception("Failed to load public jobs")
+    return []
 
 
 def cancel_kb():
@@ -195,7 +190,7 @@ async def run_bot():
             document_id = upload_res["document_id"]
             await state.update_data(document_id=document_id)
 
-            await api_call("POST", "/api/parsing/run", json_data={"document_id": document_id}, use_recruiter_header=False)
+            await api_call("POST", "/api/parsing/run", json_data={"document_id": document_id})
 
             await m.answer("Резюме загружено. Начинаю обработку, это может занять до нескольких минут...")
 
