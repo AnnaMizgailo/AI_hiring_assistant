@@ -5,17 +5,23 @@ from typing import List
 SECTION_HINTS = [
     "skills",
     "technical skills",
-    "kompetenzen",
-    "kenntnisse",
+    "навыки",
+    "технические навыки",
+
     "experience",
     "professional experience",
-    "berufserfahrung",
+    "опыт",
+    "опыт работы",
+
     "projects",
-    "projekte",
+    "проекты",
+
     "education",
-    "ausbildung",
-    "zertifikate",
+    "образование",
+
     "certifications",
+    "certificates",
+    "сертификаты",
 ]
 
 
