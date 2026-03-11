@@ -348,7 +348,6 @@ curl http://127.0.0.1:11434/api/tags
 ```env
 BOT_TOKEN=PASTE_YOUR_TELEGRAM_BOT_TOKEN_HERE
 API_BASE=http://127.0.0.1:8000
-RECRUITER_ID=demo-recruiter
 
 OLLAMA_BASE_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=qwen3:1.7b
@@ -487,12 +486,14 @@ http://127.0.0.1:8000/api/google/callback
 
 ```text
 http://127.0.0.1:8000/api/google/callback
+http://127.0.0.1:8000/api/auth/google/callback
 ```
 
 Если планируете запуск с `localhost`, можно добавить и второй вариант:
 
 ```text
 http://localhost:8000/api/google/callback
+http://localhost:8000/api/auth/google/callback
 ```
 
 6. Нажмите **Create**.
@@ -538,7 +539,7 @@ New-Item -ItemType Directory -Force storage_resumes | Out-Null
 ### Linux / macOS
 
 ```bash
-cd ~/final_merged_project
+cd ~/merged_project
 source .venv/bin/activate
 fuser -k 8000/tcp || true
 uvicorn app:app --reload
@@ -577,7 +578,7 @@ http://127.0.0.1:8000
 Откройте **второй терминал**:
 
 ```bash
-cd ~/final_merged_project
+cd ~/merged_project
 source .venv/bin/activate
 python tg_bot.py
 ```

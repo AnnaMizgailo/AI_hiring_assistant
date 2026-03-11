@@ -1,335 +1,628 @@
-import os
 import asyncio
-from typing import Dict, Optional, Any, List
+import logging
+import os
+from collections import OrderedDict
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
+import httpx
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import CallbackQuery, Document, InlineKeyboardMarkup, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-import httpx
-
-API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
+API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000").rstrip("/")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-RECRUITER_ID = os.getenv("RECRUITER_ID", "demo-recruiter")
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is empty. Проверьте .env файл")
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "30"))
+UPLOAD_TIMEOUT = float(os.getenv("UPLOAD_TIMEOUT", "120"))
+BOOKING_TIMEOUT = float(os.getenv("BOOKING_TIMEOUT", "90"))
+
+PARSING_TIMEOUT_SECONDS = int(os.getenv("PARSING_TIMEOUT_SECONDS", "600"))
+PARSING_POLL_INTERVAL = float(os.getenv("PARSING_POLL_INTERVAL", "3"))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
 class CandidateFlow(StatesGroup):
-    SELECTING_JOB = State()
-    WAITING_RESUME = State()
-    ASK_SALARY = State()
-    ASK_WORK_FORMAT = State()
-    ASK_REASON = State()
-    ASK_ENGLISH = State()
-    WAITING_SLOT = State()
-    FINISHED = State()
+    selecting_job = State()
+    waiting_resume = State()
+    ask_salary = State()
+    ask_work_format = State()
+    ask_reason = State()
+    ask_english = State()
+    choosing_day = State()
+    choosing_slot = State()
+
+
+def build_timeout(total_seconds: float | None) -> httpx.Timeout | None:
+    if total_seconds is None:
+        return None
+    return httpx.Timeout(
+        connect=min(20.0, total_seconds),
+        read=total_seconds,
+        write=total_seconds,
+        pool=min(20.0, total_seconds),
+    )
 
 
 async def api_call(
     method: str,
     endpoint: str,
-    json_data: Optional[Dict] = None,
-    files: Optional[Dict] = None,
-    params: Optional[Dict] = None,
-    use_recruiter_header: bool = True,
-) -> Dict:
+    *,
+    json_data: Optional[Dict[str, Any]] = None,
+    files: Optional[Dict[str, Any]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    timeout_seconds: Optional[float] = REQUEST_TIMEOUT,
+) -> Any:
     url = f"{API_BASE}{endpoint}"
-    headers = {}
-    if use_recruiter_header:
-        headers["X-Recruiter-ID"] = RECRUITER_ID
+    timeout = build_timeout(timeout_seconds)
 
-    async with httpx.AsyncClient(timeout=180.0) as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         if method.upper() == "GET":
-            r = await client.get(url, headers=headers, params=params)
+            response = await client.get(url, params=params)
         elif method.upper() == "POST":
-            if files:
-                r = await client.post(url, headers=headers, files=files, data=json_data or {}, params=params)
+            if files is not None:
+                response = await client.post(url, files=files, data=json_data or {}, params=params)
             else:
-                r = await client.post(url, headers=headers, json=json_data, params=params)
+                response = await client.post(url, json=json_data, params=params)
         elif method.upper() == "PATCH":
-            r = await client.patch(url, headers=headers, json=json_data, params=params)
+            response = await client.patch(url, json=json_data, params=params)
         else:
             raise ValueError(f"Unsupported method: {method}")
 
-        r.raise_for_status()
-        return r.json()
+    response.raise_for_status()
+    if not response.content:
+        return {}
+    return response.json()
 
 
-
-
-async def wait_for_document_parsing(document_id: str, timeout_seconds: int = 600, poll_interval: float = 3.0) -> Dict[str, Any]:
-    deadline = asyncio.get_running_loop().time() + timeout_seconds
-    last_status = None
+async def wait_for_document_parsing(document_id: str) -> Dict[str, Any]:
+    deadline = asyncio.get_running_loop().time() + PARSING_TIMEOUT_SECONDS
+    last_status: Dict[str, Any] = {}
 
     while asyncio.get_running_loop().time() < deadline:
-        status = await api_call("GET", f"/api/documents/{document_id}", use_recruiter_header=False)
-        parse_status = (status.get("parse_status") or "").upper()
-        last_status = status
+        status = await api_call("GET", f"/api/documents/{document_id}", timeout_seconds=REQUEST_TIMEOUT)
+        last_status = status or {}
+        parse_status = str(last_status.get("parse_status", "")).upper()
 
         if parse_status == "DONE":
-            return status
+            return last_status
         if parse_status == "ERROR":
-            message = status.get("last_error") or "Не удалось обработать резюме."
+            message = last_status.get("last_error") or "Не удалось обработать резюме."
             raise RuntimeError(message)
 
-        await asyncio.sleep(poll_interval)
+        await asyncio.sleep(PARSING_POLL_INTERVAL)
 
-    raise TimeoutError(f"Парсинг резюме не завершился за {timeout_seconds} секунд. Последний статус: {last_status}")
+    raise TimeoutError(
+        f"Парсинг резюме не завершился за {PARSING_TIMEOUT_SECONDS} секунд. Последний статус: {last_status}"
+    )
 
 
 async def load_jobs_for_candidate() -> List[Dict[str, Any]]:
-    """
-    Сначала пытаемся получить публичный список вакансий для кандидата.
-    Если такого эндпойнта ещё нет, используем текущий recruiter-scoped /api/jobs.
-    """
-    try:
-        jobs = await api_call("GET", "/api/public/jobs", use_recruiter_header=False)
-        if isinstance(jobs, list):
-            return jobs
-    except Exception:
-        pass
-
-    jobs = await api_call("GET", "/api/jobs", use_recruiter_header=True)
+    jobs = await api_call("GET", "/api/public/jobs", timeout_seconds=REQUEST_TIMEOUT)
     return jobs if isinstance(jobs, list) else []
 
 
-def cancel_kb():
+def main_menu_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="Отмена", callback_data="cancel")
+    kb.button(text="📋 Список вакансий", callback_data="list_jobs")
+    kb.button(text="ℹ️ Помощь", callback_data="help")
+    kb.adjust(1)
     return kb.as_markup()
 
 
-async def run_bot():
+def back_to_main_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="◀️ Назад", callback_data="back_to_main")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def cancel_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Отмена", callback_data="cancel")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def jobs_keyboard(jobs: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for job in jobs:
+        kb.button(
+            text=f"{job.get('title', 'Без названия')} (порог {job.get('threshold_score', '—')})",
+            callback_data=f"job:{job['id']}",
+        )
+    kb.button(text="◀️ Назад", callback_data="back_to_main")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def build_days_keyboard(slots: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    day_map: "OrderedDict[str, str]" = OrderedDict()
+    for slot in slots:
+        start_dt = datetime.fromisoformat(slot["start_dt"].replace("Z", "+00:00"))
+        day_key = start_dt.strftime("%Y-%m-%d")
+        day_label = start_dt.strftime("%d.%m.%Y")
+        day_map.setdefault(day_key, day_label)
+
+    kb = InlineKeyboardBuilder()
+    for day_key, day_label in day_map.items():
+        kb.button(text=day_label, callback_data=f"day:{day_key}")
+    kb.button(text="Отмена", callback_data="cancel")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def build_slots_keyboard(slots: List[Dict[str, Any]], day_key: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for slot in slots:
+        start_dt = datetime.fromisoformat(slot["start_dt"].replace("Z", "+00:00"))
+        if start_dt.strftime("%Y-%m-%d") != day_key:
+            continue
+        end_dt = datetime.fromisoformat(slot["end_dt"].replace("Z", "+00:00"))
+        label = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}"
+        kb.button(text=label, callback_data=f"slot:{slot['slot_id']}")
+    kb.button(text="⬅️ Назад к дням", callback_data="choose_days")
+    kb.button(text="Отмена", callback_data="cancel")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def format_rejection_message(decision_res: Dict[str, Any]) -> str:
+    score = decision_res.get("score")
+    threshold = decision_res.get("threshold_score")
+    summary = decision_res.get("screening_summary") or "Краткое summary пока недоступно."
+    feedback = decision_res.get("feedback") or "Спасибо за отклик. На текущем этапе мы не готовы продолжить процесс."
+
+    parts = []
+    if score is not None and threshold is not None:
+        parts.append(f"Ваш результат: {score} из {threshold}.")
+    parts.append(summary)
+    parts.append(feedback)
+    return "\n\n".join(part for part in parts if part)
+
+
+async def run_bot() -> None:
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is empty. Проверьте .env файл")
+
     bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher()
+    dp = Dispatcher(storage=MemoryStorage())
 
-    @dp.message(CommandStart())
-    async def cmd_start(m: Message, state: FSMContext):
-        try:
-            jobs = await load_jobs_for_candidate()
-            if not jobs:
-                await m.answer(
-                    "Вакансий пока нет.\n"
-                    "Проверьте, что вакансия создана в веб-интерфейсе и сервер запущен."
-                )
-                return
-
-            kb = InlineKeyboardBuilder()
-            for j in jobs:
-                threshold = j.get("threshold_score", "—")
-                title = j.get("title", "Без названия")
-                kb.button(text=f"{title} (порог {threshold})", callback_data=f"job:{j['id']}")
-            kb.adjust(1)
-
-            await m.answer("Выберите вакансию:", reply_markup=kb.as_markup())
-            await state.set_state(CandidateFlow.SELECTING_JOB)
-        except Exception as e:
-            await m.answer(f"Не удалось загрузить вакансии.\n{str(e)}")
-
-    @dp.callback_query(F.data == "cancel")
-    async def cancel_handler(c: CallbackQuery, state: FSMContext):
-        await state.clear()
-        await c.message.edit_text("Действие отменено. Начните заново командой /start")
-        await c.answer()
-
-    @dp.callback_query(F.data.startswith("job:"))
-    async def job_selected(c: CallbackQuery, state: FSMContext):
-        job_id = c.data.split(":", 1)[1]
-        user = c.from_user
-        payload = {
-            "job_id": job_id,
-            "telegram_user_id": user.id,
-            "telegram_username": user.username or None,
-        }
-        try:
-            res = await api_call("POST", "/api/applications", json_data=payload)
-            await state.update_data(
-                application_id=res["application_id"],
-                candidate_id=res["candidate_id"],
-                job_id=job_id,
+    async def show_jobs_message(target: Message | CallbackQuery, state: FSMContext) -> None:
+        jobs = await load_jobs_for_candidate()
+        if not jobs:
+            text = (
+                "Сейчас нет доступных вакансий.\n\n"
+                "Сначала рекрутер должен создать вакансию на сайте http://127.0.0.1:8000, "
+                "после этого она появится здесь автоматически."
             )
-            await c.message.answer(
-                "Отклик создан. Пришлите резюме файлом (PDF или DOCX).",
-                reply_markup=cancel_kb(),
-            )
-            await state.set_state(CandidateFlow.WAITING_RESUME)
-        except Exception as e:
-            await c.message.answer(f"Ошибка создания отклика:\n{str(e)}")
-        await c.answer()
-
-    @dp.message(F.document, CandidateFlow.WAITING_RESUME)
-    async def handle_resume(m: Message, state: FSMContext, bot: Bot):
-        doc = m.document
-        allowed_types = [
-            "application/pdf",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        ]
-        if doc.mime_type not in allowed_types:
-            await m.answer("Поддерживаются только PDF и DOCX файлы.", reply_markup=cancel_kb())
+            if isinstance(target, CallbackQuery):
+                await target.message.edit_text(text, reply_markup=back_to_main_keyboard())
+                await target.answer()
+            else:
+                await target.answer(text, reply_markup=main_menu_keyboard())
+            await state.clear()
             return
 
-        data = await state.get_data()
-        candidate_id = data["candidate_id"]
+        if isinstance(target, CallbackQuery):
+            await target.message.edit_text(
+                "Выберите вакансию для отклика:",
+                reply_markup=jobs_keyboard(jobs),
+            )
+            await target.answer()
+        else:
+            await target.answer(
+                "Выберите вакансию для отклика:",
+                reply_markup=jobs_keyboard(jobs),
+            )
+
+        await state.update_data(available_jobs={job["id"]: job for job in jobs})
+        await state.set_state(CandidateFlow.selecting_job)
+
+    @dp.message(CommandStart())
+    async def start_command(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await message.answer(
+            "👋 Добро пожаловать в HR Assistant Bot!\n\n"
+            "Здесь вы можете выбрать актуальную вакансию, загруженную рекрутером через веб-интерфейс, "
+            "отправить резюме и пройти первичный отбор.",
+            reply_markup=main_menu_keyboard(),
+        )
+
+    @dp.message(Command("help"))
+    async def help_command(message: Message) -> None:
+        await message.answer(
+            "Как это работает:\n"
+            "1. Рекрутер создаёт вакансию на сайте.\n"
+            "2. Вы выбираете одну из доступных вакансий в боте.\n"
+            "3. Отправляете резюме.\n"
+            "4. Проходите короткий скрининг.\n"
+            "5. Система принимает решение именно по выбранной вакансии.\n"
+            "6. При успехе вы выбираете день и время собеседования.",
+            reply_markup=back_to_main_keyboard(),
+        )
+
+    @dp.callback_query(F.data == "help")
+    async def help_callback(callback: CallbackQuery) -> None:
+        await callback.message.edit_text(
+            "Как это работает:\n"
+            "1. Рекрутер создаёт вакансию на сайте.\n"
+            "2. Вы выбираете одну из доступных вакансий в боте.\n"
+            "3. Отправляете резюме.\n"
+            "4. Проходите короткий скрининг.\n"
+            "5. Система принимает решение именно по выбранной вакансии.\n"
+            "6. При успехе вы выбираете день и время собеседования.",
+            reply_markup=back_to_main_keyboard(),
+        )
+        await callback.answer()
+
+    @dp.callback_query(F.data == "back_to_main")
+    async def back_to_main(callback: CallbackQuery, state: FSMContext) -> None:
+        await state.clear()
+        await callback.message.edit_text(
+            "Главное меню. Выберите действие:",
+            reply_markup=main_menu_keyboard(),
+        )
+        await callback.answer()
+
+    @dp.callback_query(F.data == "cancel")
+    async def cancel_handler(callback: CallbackQuery, state: FSMContext) -> None:
+        await state.clear()
+        await callback.message.edit_text(
+            "Действие отменено. Можно начать заново через /start или открыть список вакансий.",
+            reply_markup=main_menu_keyboard(),
+        )
+        await callback.answer()
+
+    @dp.callback_query(F.data == "list_jobs")
+    async def show_jobs_callback(callback: CallbackQuery, state: FSMContext) -> None:
+        await show_jobs_message(callback, state)
+
+    @dp.callback_query(F.data.startswith("job:"))
+    async def job_selected(callback: CallbackQuery, state: FSMContext) -> None:
+        job_id = callback.data.split(":", 1)[1]
+        state_data = await state.get_data()
+        available_jobs = state_data.get("available_jobs", {})
+        selected_job = available_jobs.get(job_id)
+
+        if not selected_job:
+            jobs = await load_jobs_for_candidate()
+            selected_job = next((job for job in jobs if job["id"] == job_id), None)
+
+        if not selected_job:
+            await callback.message.edit_text(
+                "Вакансия не найдена. Возможно, она была удалена рекрутером. Выберите другую.",
+                reply_markup=back_to_main_keyboard(),
+            )
+            await callback.answer()
+            await state.clear()
+            return
+
+        payload = {
+            "job_id": job_id,
+            "telegram_user_id": callback.from_user.id,
+            "telegram_username": callback.from_user.username or None,
+        }
 
         try:
-            file_info = await bot.get_file(doc.file_id)
-            file_bytes = await bot.download_file(file_info.file_path)
+            result = await api_call(
+                "POST",
+                "/api/applications",
+                json_data=payload,
+                timeout_seconds=REQUEST_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.exception("Failed to create application")
+            await callback.message.edit_text(
+                f"Не удалось создать отклик: {exc}",
+                reply_markup=back_to_main_keyboard(),
+            )
+            await callback.answer()
+            await state.clear()
+            return
 
-            files = {
-                "file": (
-                    doc.file_name or "resume.pdf",
-                    file_bytes.getvalue(),
-                    doc.mime_type,
-                )
-            }
+        await state.update_data(
+            application_id=result["application_id"],
+            candidate_id=result["candidate_id"],
+            job_id=job_id,
+            job_title=selected_job.get("title", "Без названия"),
+            threshold_score=selected_job.get("threshold_score"),
+        )
+        await state.set_state(CandidateFlow.waiting_resume)
 
-            upload_res = await api_call("POST", f"/api/candidates/{candidate_id}/documents", files=files)
-            document_id = upload_res["document_id"]
+        await callback.message.edit_text(
+            f"✅ Отклик на вакансию «{selected_job.get('title', 'Без названия')}» создан.\n\n"
+            "Теперь отправьте резюме одним файлом в формате PDF, DOC, DOCX или TXT.",
+            reply_markup=cancel_keyboard(),
+        )
+        await callback.answer()
+
+    @dp.message(CandidateFlow.waiting_resume, F.document)
+    async def handle_resume(message: Message, state: FSMContext, bot: Bot) -> None:
+        document: Document = message.document
+        filename = document.file_name or "resume"
+        allowed_extensions = (".pdf", ".doc", ".docx", ".txt")
+
+        if not filename.lower().endswith(allowed_extensions):
+            await message.answer(
+                "Поддерживаются только PDF, DOC, DOCX или TXT файлы.",
+                reply_markup=cancel_keyboard(),
+            )
+            return
+
+        state_data = await state.get_data()
+        candidate_id = state_data.get("candidate_id")
+        if not candidate_id:
+            await state.clear()
+            await message.answer(
+                "Не удалось найти данные отклика. Начните заново через /start.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        status_message = await message.answer("📥 Получил резюме. Загружаю и запускаю обработку...")
+
+        try:
+            file_info = await bot.get_file(document.file_id)
+            file_buffer = await bot.download_file(file_info.file_path)
+            file_bytes = file_buffer.read()
+
+            upload_result = await api_call(
+                "POST",
+                f"/api/candidates/{candidate_id}/documents",
+                files={"file": (filename, file_bytes, document.mime_type or "application/octet-stream")},
+                timeout_seconds=UPLOAD_TIMEOUT,
+            )
+            document_id = upload_result["document_id"]
             await state.update_data(document_id=document_id)
 
-            await api_call("POST", "/api/parsing/run", json_data={"document_id": document_id}, use_recruiter_header=False)
-
-            await m.answer("Резюме загружено. Начинаю обработку, это может занять до нескольких минут...")
-
-            try:
-                await wait_for_document_parsing(document_id, timeout_seconds=600, poll_interval=3.0)
-            except TimeoutError:
-                await m.answer("Резюме ещё обрабатывается слишком долго. Попробуйте немного позже.")
-                return
-            except RuntimeError as e:
-                await m.answer(f"Ошибка при обработке резюме: {e}")
-                return
-            except Exception as e:
-                await m.answer(f"Ошибка при обработке резюме: {e}")
-                return
-
-            await m.answer("Резюме обработано. Продолжаем.")
-
-            await m.answer(
-                "Укажите ваши зарплатные ожидания (в рублях на руки в месяц):",
-                reply_markup=cancel_kb(),
+            await api_call(
+                "POST",
+                "/api/parsing/run",
+                json_data={"document_id": document_id},
+                timeout_seconds=REQUEST_TIMEOUT,
             )
-            await state.set_state(CandidateFlow.ASK_SALARY)
 
-        except Exception as e:
-            await m.answer(f"Ошибка при обработке резюме:\n{str(e)}", reply_markup=cancel_kb())
+            await status_message.edit_text("🔄 Анализирую резюме. Это может занять некоторое время...")
+            await wait_for_document_parsing(document_id)
+
+            await status_message.edit_text("✅ Резюме обработано. Переходим к короткому скринингу.")
+            await message.answer(
+                "1/4. Какие у вас зарплатные ожидания?",
+                reply_markup=cancel_keyboard(),
+            )
+            await state.set_state(CandidateFlow.ask_salary)
+        except TimeoutError:
+            await status_message.edit_text(
+                "⏱️ Обработка резюме заняла слишком много времени. Попробуйте чуть позже."
+            )
+            await state.clear()
+        except RuntimeError as exc:
+            await status_message.edit_text(f"❌ Ошибка при обработке резюме: {exc}")
+            await state.clear()
+        except Exception as exc:
+            logger.exception("Failed to handle resume")
+            await status_message.edit_text(f"❌ Не удалось обработать резюме: {exc}")
             await state.clear()
 
-    @dp.message(CandidateFlow.ASK_SALARY)
-    async def process_salary(m: Message, state: FSMContext):
-        await state.update_data(salary_expectation=m.text.strip())
-        await m.answer("Какой формат работы вас интересует?\n(офис / гибрид / удалённо)", reply_markup=cancel_kb())
-        await state.set_state(CandidateFlow.ASK_WORK_FORMAT)
+    @dp.message(CandidateFlow.waiting_resume)
+    async def handle_resume_wrong_type(message: Message) -> None:
+        await message.answer(
+            "Пожалуйста, отправьте резюме именно файлом.",
+            reply_markup=cancel_keyboard(),
+        )
 
-    @dp.message(CandidateFlow.ASK_WORK_FORMAT)
-    async def process_format(m: Message, state: FSMContext):
-        await state.update_data(work_format=m.text.strip())
-        await m.answer("По какой причине рассматриваете смену работы?", reply_markup=cancel_kb())
-        await state.set_state(CandidateFlow.ASK_REASON)
+    @dp.message(CandidateFlow.ask_salary)
+    async def process_salary(message: Message, state: FSMContext) -> None:
+        await state.update_data(salary_expectation=(message.text or "").strip())
+        await message.answer(
+            "1/4 сохранено.\n\n2/4. Какой формат работы вам подходит? (офис / гибрид / удалённо)",
+            reply_markup=cancel_keyboard(),
+        )
+        await state.set_state(CandidateFlow.ask_work_format)
 
-    @dp.message(CandidateFlow.ASK_REASON)
-    async def process_reason(m: Message, state: FSMContext):
-        await state.update_data(reason=m.text.strip())
-        await m.answer("Какой у вас уровень английского? (A1–C2 или None)", reply_markup=cancel_kb())
-        await state.set_state(CandidateFlow.ASK_ENGLISH)
+    @dp.message(CandidateFlow.ask_work_format)
+    async def process_work_format(message: Message, state: FSMContext) -> None:
+        await state.update_data(work_format=(message.text or "").strip())
+        await message.answer(
+            "2/4 сохранено.\n\n3/4. Почему вас заинтересовала эта вакансия?",
+            reply_markup=cancel_keyboard(),
+        )
+        await state.set_state(CandidateFlow.ask_reason)
 
-    @dp.message(CandidateFlow.ASK_ENGLISH)
-    async def process_english(m: Message, state: FSMContext):
-        english_level = m.text.strip()
+    @dp.message(CandidateFlow.ask_reason)
+    async def process_reason(message: Message, state: FSMContext) -> None:
+        await state.update_data(reason=(message.text or "").strip())
+        await message.answer(
+            "3/4 сохранено.\n\n4/4. Какой у вас уровень английского?",
+            reply_markup=cancel_keyboard(),
+        )
+        await state.set_state(CandidateFlow.ask_english)
+
+    @dp.message(CandidateFlow.ask_english)
+    async def process_english(message: Message, state: FSMContext) -> None:
+        english_level = (message.text or "").strip()
         await state.update_data(english_level=english_level)
-
         data = await state.get_data()
-        app_id = data["application_id"]
+        application_id = data["application_id"]
 
-        await m.answer("Спасибо! Проверяем вашу кандидатуру...")
+        screening_answers = {
+            "salary_expectation": data.get("salary_expectation"),
+            "work_format": data.get("work_format"),
+            "reason": data.get("reason"),
+            "english_level": english_level,
+        }
+
+        status_message = await message.answer(
+            "📝 Сохраняю ответы и запускаю финальную обработку заявки.\n"
+            "Это может занять некоторое время — дождитесь ответа."
+        )
 
         try:
             await api_call(
                 "PATCH",
-                f"/api/applications/{app_id}/screening-answers",
-                json_data={
-                    "salary_expectation": data.get("salary_expectation"),
-                    "work_format": data.get("work_format"),
-                    "reason": data.get("reason"),
-                    "english_level": english_level,
-                },
+                f"/api/applications/{application_id}/screening-answers",
+                json_data=screening_answers,
+                timeout_seconds=REQUEST_TIMEOUT,
             )
 
-            decision_res = await api_call("POST", f"/api/applications/{app_id}/decision")
-
-            score = decision_res.get("score")
-            threshold = decision_res.get("threshold_score")
-            summary = decision_res.get("screening_summary") or "Краткая сводка пока недоступна."
-
-            if decision_res.get("decision") == "INTERVIEW":
-                slots = decision_res.get("slots") or []
-                if not slots:
-                    await m.answer(
-                        "Вы прошли отбор, но сейчас нет свободных слотов.\n"
-                        "Мы свяжемся с вами позже."
-                    )
-                    await state.set_state(CandidateFlow.FINISHED)
-                    return
-
-                kb = InlineKeyboardBuilder()
-                for s in slots:
-                    kb.button(text=s["label"], callback_data=f"slot:{s['slot_id']}")
-                kb.button(text="Отмена", callback_data="cancel")
-                kb.adjust(1)
-
-                await m.answer(
-                    f"Score: {score}/{threshold}. Вы прошли первичный отбор!\n\n"
-                    f"Краткая сводка: {summary}\n\n"
-                    "Выберите удобное время для интервью:",
-                    reply_markup=kb.as_markup(),
-                )
-                await state.set_state(CandidateFlow.WAITING_SLOT)
-
-            else:
-                feedback = decision_res.get("feedback") or (
-                    "Спасибо за отклик! На этом этапе мы не можем продолжить процесс."
-                )
-                await m.answer(feedback)
-                await state.set_state(CandidateFlow.FINISHED)
-
-        except Exception as e:
-            await m.answer(f"Ошибка при финальной обработке кандидатуры:\n{str(e)}")
+            decision_res = await api_call(
+                "POST",
+                f"/api/applications/{application_id}/decision",
+                timeout_seconds=None,
+            )
+        except Exception as exc:
+            logger.exception("Failed after screening")
+            await status_message.edit_text(f"❌ Не удалось обработать анкету: {exc}")
             await state.clear()
+            return
 
-    @dp.callback_query(F.data.startswith("slot:"))
-    async def select_slot(c: CallbackQuery, state: FSMContext):
-        slot_id = c.data.split(":", 1)[1]
+        decision = decision_res.get("decision")
+        score = decision_res.get("score")
+        threshold = decision_res.get("threshold_score")
+        summary = decision_res.get("screening_summary") or "Краткое summary пока недоступно."
+        job_title = data.get("job_title", "выбранная вакансия")
+
+        if decision == "INTERVIEW":
+            slots = decision_res.get("slots") or []
+            if not slots:
+                await status_message.edit_text(
+                    f"✅ По вакансии «{job_title}» вы прошли первичный отбор.\n\n"
+                    f"Score: {score} из {threshold}.\n\n"
+                    f"{summary}\n\n"
+                    "Сейчас свободных слотов нет. Попробуйте позже."
+                )
+                await state.clear()
+                return
+
+            await state.update_data(available_slots=slots)
+            await status_message.edit_text(
+                f"✅ По вакансии «{job_title}» вы прошли первичный отбор.\n\n"
+                f"Score: {score} из {threshold}.\n\n"
+                f"{summary}\n\n"
+                "Выберите день для собеседования:"
+            )
+            await message.answer(
+                "Доступны только свободные интервалы по этой вакансии и календарю рекрутера.",
+                reply_markup=build_days_keyboard(slots),
+            )
+            await state.set_state(CandidateFlow.choosing_day)
+            return
+
+        await status_message.edit_text(format_rejection_message(decision_res))
+        await state.clear()
+
+    @dp.callback_query(F.data == "choose_days")
+    async def choose_days_again(callback: CallbackQuery, state: FSMContext) -> None:
         data = await state.get_data()
-        app_id = data["application_id"]
+        slots = data.get("available_slots") or []
+        if not slots:
+            await callback.message.edit_text(
+                "Список слотов устарел. Начните заново через /start.",
+                reply_markup=main_menu_keyboard(),
+            )
+            await state.clear()
+            await callback.answer()
+            return
+
+        await callback.message.edit_text(
+            "Выберите день для собеседования:",
+            reply_markup=build_days_keyboard(slots),
+        )
+        await state.set_state(CandidateFlow.choosing_day)
+        await callback.answer()
+
+    @dp.callback_query(CandidateFlow.choosing_day, F.data.startswith("day:"))
+    async def choose_day(callback: CallbackQuery, state: FSMContext) -> None:
+        day_key = callback.data.split(":", 1)[1]
+        data = await state.get_data()
+        slots = data.get("available_slots") or []
+        if not slots:
+            await callback.message.edit_text(
+                "Список слотов устарел. Начните заново через /start.",
+                reply_markup=main_menu_keyboard(),
+            )
+            await state.clear()
+            await callback.answer()
+            return
+
+        await state.update_data(selected_day=day_key)
+        await callback.message.edit_text(
+            "Выберите удобное время:",
+            reply_markup=build_slots_keyboard(slots, day_key),
+        )
+        await state.set_state(CandidateFlow.choosing_slot)
+        await callback.answer()
+
+    @dp.callback_query(CandidateFlow.choosing_slot, F.data.startswith("slot:"))
+    async def choose_slot(callback: CallbackQuery, state: FSMContext) -> None:
+        slot_id = callback.data.split(":", 1)[1]
+        data = await state.get_data()
+        application_id = data.get("application_id")
+        slots = data.get("available_slots") or []
+        selected_slot = next((slot for slot in slots if slot["slot_id"] == slot_id), None)
+
+        if not application_id:
+            await callback.message.edit_text(
+                "Не удалось найти данные отклика. Начните заново через /start.",
+                reply_markup=main_menu_keyboard(),
+            )
+            await state.clear()
+            await callback.answer()
+            return
 
         try:
             booking = await api_call(
                 "POST",
-                f"/api/applications/{app_id}/book-slot",
+                f"/api/applications/{application_id}/book-slot",
                 json_data={"slot_id": slot_id},
+                timeout_seconds=BOOKING_TIMEOUT,
             )
-            await c.message.edit_text(
-                "Интервью забронировано!\n\n"
-                f"Дата начала: {booking['start_dt']}\n"
-                f"Дата окончания: {booking['end_dt']}\n"
-                f"ID события: {booking['event_id']}\n\n"
-                "Если у рекрутера подключён реальный Google Calendar, встреча уже создана там."
+        except Exception as exc:
+            logger.exception("Failed to book slot")
+            await callback.message.edit_text(
+                f"Не удалось забронировать время: {exc}",
+                reply_markup=build_slots_keyboard(slots, data.get("selected_day", "")),
             )
-            await state.set_state(CandidateFlow.FINISHED)
+            await callback.answer()
+            return
 
-        except Exception as e:
-            await c.message.answer(f"Не удалось забронировать слот:\n{str(e)}")
-            await state.clear()
+        label = selected_slot.get("label") if selected_slot else f"{booking.get('start_dt')} - {booking.get('end_dt')}"
+        await callback.message.edit_text(
+            "✅ Собеседование подтверждено!\n\n"
+            f"Вакансия: {data.get('job_title', 'выбранная вакансия')}\n"
+            f"Слот: {label}\n"
+            f"Статус: {booking.get('status')}\n\n"
+            "Событие уже передано в календарь рекрутера."
+        )
+        await state.clear()
+        await callback.answer()
 
-        await c.answer()
+    @dp.message()
+    async def fallback_message(message: Message, state: FSMContext) -> None:
+        current_state = await state.get_state()
+        if current_state is None:
+            await message.answer(
+                "Используйте /start, чтобы увидеть актуальные вакансии, созданные рекрутером на сайте.",
+                reply_markup=main_menu_keyboard(),
+            )
+        else:
+            await message.answer(
+                "Сообщение не распознано в текущем шаге. Следуйте сценарию или нажмите «Отмена».",
+                reply_markup=cancel_keyboard(),
+            )
 
     await dp.start_polling(bot)
 

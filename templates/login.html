@@ -1,25 +1,193 @@
 {% extends "base.html" %}
 
 {% block content %}
-<h1>Вход для рекрутера</h1>
-<form id="loginForm">
-    <label for="recruiter_id">Ваш ID рекрутера:</label>
-    <input type="text" id="recruiter_id" name="recruiter_id" required>
-    <button type="submit" class="btn btn-lg"><i class="fas fa-sign-in-alt"></i> Войти</button>
-</form>
-{% endblock %}
+<div style="max-width: 400px; margin: 0 auto;">
+    <h1><i class="fas fa-user-plus"></i> Добро пожаловать!</h1>
+    
+    <!-- Вкладки для переключения между способами входа -->
+    <div style="display: flex; gap: 1rem; margin-bottom: 2rem;">
+        <button class="btn" id="showEmailLoginBtn" style="flex: 1;">Email</button>
+        <button class="btn btn-warning" id="showGoogleLoginBtn" style="flex: 1;">Google</button>
+    </div>
+    
+    <!-- Форма входа по email (изначально видна) -->
+    <div id="emailLoginContainer">
+        <h2><i class="fas fa-envelope"></i> Вход по email</h2>
+        <form id="loginForm">
+            <div>
+                <label><i class="fas fa-envelope"></i> Email:</label>
+                <input type="email" id="loginEmail" required placeholder="your@email.com">
+            </div>
+            <div>
+                <label><i class="fas fa-lock"></i> Пароль:</label>
+                <input type="password" id="loginPassword" required>
+            </div>
+            <button type="submit" class="btn btn-lg" style="width: 100%;">
+                <i class="fas fa-sign-in-alt"></i> Войти
+            </button>
+        </form>
+        
+        <div style="text-align: center; margin: 1rem 0; color: var(--pikmi-mauve);">
+            <span>Нет аккаунта? <a href="#" id="showRegisterLink">Зарегистрироваться</a></span>
+        </div>
+    </div>
+    
+    <!-- Форма регистрации (изначально скрыта) -->
+    <div id="registerContainer" style="display: none;">
+        <h2><i class="fas fa-user-plus"></i> Регистрация</h2>
+        <form id="registerForm">
+            <div>
+                <label><i class="fas fa-user"></i> Имя (необязательно):</label>
+                <input type="text" id="regFullName" placeholder="Как к вам обращаться?">
+            </div>
+            <div>
+                <label><i class="fas fa-envelope"></i> Email:</label>
+                <input type="email" id="regEmail" required placeholder="your@email.com">
+            </div>
+            <div>
+                <label><i class="fas fa-lock"></i> Пароль:</label>
+                <input type="password" id="regPassword" required minlength="6">
+                <small style="color: var(--pikmi-mauve);">Минимум 6 символов</small>
+            </div>
+            <button type="submit" class="btn btn-warning btn-lg" style="width: 100%;">
+                <i class="fas fa-user-plus"></i> Зарегистрироваться
+            </button>
+        </form>
+    </div>
+    
+    <!-- Google вход -->
+    <div id="googleLoginContainer" style="display: none;">
+        <h2><i class="fab fa-google"></i> Вход через Google</h2>
+        <p style="text-align: center; margin-bottom: 2rem; color: var(--pikmi-mauve);">
+            Быстрый и безопасный вход через ваш Google аккаунт
+        </p>
+        
+        <button id="googleLoginBtn" class="btn btn-lg" style="width: 100%; background: #4285f4; border-color: #357ae8; margin-bottom: 1rem;">
+            <i class="fab fa-google"></i> Войти через Google
+        </button>
+        
+        <p style="font-size: 0.9rem; text-align: center; color: var(--pikmi-mauve);">
+            При первом входе аккаунт будет создан автоматически
+        </p>
+    </div>
+</div>
 
-{% block scripts %}
+<!-- Скрытое окно для Google OAuth -->
 <script>
-document.getElementById('loginForm').addEventListener('submit', function(e) {
-    e.preventDefault();
-    const recruiterId = document.getElementById('recruiter_id').value.trim();
-    if (recruiterId) {
-        localStorage.setItem('recruiter_id', recruiterId);
-        window.location.href = '/jobs';
-    } else {
-        alert('Пожалуйста, введите ID рекрутера');
-    }
-});
+    let googleAuthWindow = null;
+    
+    document.getElementById('googleLoginBtn').addEventListener('click', async function() {
+        const width = 500;
+        const height = 600;
+        const left = (screen.width / 2) - (width / 2);
+        const top = (screen.height / 2) - (height / 2);
+        
+        googleAuthWindow = window.open(
+            '/api/auth/google/login',
+            'google-auth',
+            `width=${width},height=${height},left=${left},top=${top}`
+        );
+    });
+    
+    window.addEventListener('message', function(event) {
+        if (event.data.type === 'google-auth-success') {
+            localStorage.setItem('access_token', event.data.token);
+            localStorage.setItem('recruiter_id', event.data.recruiter_id);
+            localStorage.setItem('recruiter_email', event.data.email);
+            if (event.data.full_name) {
+                localStorage.setItem('recruiter_name', event.data.full_name);
+            }
+            window.location.href = '/jobs';
+        }
+    });
+
+    // Переключение между формами
+    document.getElementById('showEmailLoginBtn').addEventListener('click', function() {
+        document.getElementById('emailLoginContainer').style.display = 'block';
+        document.getElementById('registerContainer').style.display = 'none';
+        document.getElementById('googleLoginContainer').style.display = 'none';
+        this.classList.add('btn');
+        this.classList.remove('btn-warning');
+        document.getElementById('showGoogleLoginBtn').classList.add('btn-warning');
+        document.getElementById('showGoogleLoginBtn').classList.remove('btn');
+    });
+
+    document.getElementById('showGoogleLoginBtn').addEventListener('click', function() {
+        document.getElementById('emailLoginContainer').style.display = 'none';
+        document.getElementById('registerContainer').style.display = 'none';
+        document.getElementById('googleLoginContainer').style.display = 'block';
+        this.classList.add('btn');
+        this.classList.remove('btn-warning');
+        document.getElementById('showEmailLoginBtn').classList.add('btn-warning');
+        document.getElementById('showEmailLoginBtn').classList.remove('btn');
+    });
+
+    document.getElementById('showRegisterLink').addEventListener('click', function(e) {
+        e.preventDefault();
+        document.getElementById('emailLoginContainer').style.display = 'none';
+        document.getElementById('registerContainer').style.display = 'block';
+        document.getElementById('googleLoginContainer').style.display = 'none';
+        document.getElementById('showEmailLoginBtn').classList.add('btn-warning');
+        document.getElementById('showEmailLoginBtn').classList.remove('btn');
+    });
+
+    // Обработка входа по email
+    document.getElementById('loginForm').addEventListener('submit', async function(e) {
+        e.preventDefault();
+        const email = document.getElementById('loginEmail').value.trim();
+        const password = document.getElementById('loginPassword').value;
+
+        try {
+            const response = await fetch('/api/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email, password })
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                localStorage.setItem('access_token', data.access_token);
+                localStorage.setItem('recruiter_id', data.recruiter_id);
+                localStorage.setItem('recruiter_email', data.email);
+                if (data.full_name) localStorage.setItem('recruiter_name', data.full_name);
+                window.location.href = '/jobs';
+            } else {
+                const error = await response.json();
+                alert('Ошибка входа: ' + (error.detail || 'Неверные данные'));
+            }
+        } catch (error) {
+            alert('Ошибка соединения с сервером');
+        }
+    });
+
+    // Обработка регистрации
+    document.getElementById('registerForm').addEventListener('submit', async function(e) {
+        e.preventDefault();
+        const fullName = document.getElementById('regFullName').value.trim() || null;
+        const email = document.getElementById('regEmail').value.trim();
+        const password = document.getElementById('regPassword').value;
+
+        try {
+            const response = await fetch('/api/auth/register', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email, password, full_name: fullName })
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                localStorage.setItem('access_token', data.access_token);
+                localStorage.setItem('recruiter_id', data.recruiter_id);
+                localStorage.setItem('recruiter_email', data.email);
+                if (data.full_name) localStorage.setItem('recruiter_name', data.full_name);
+                window.location.href = '/jobs';
+            } else {
+                const error = await response.json();
+                alert('Ошибка регистрации: ' + (error.detail || 'Неизвестная ошибка'));
+            }
+        } catch (error) {
+            alert('Ошибка соединения с сервером');
+        }
+    });
 </script>
 {% endblock %}

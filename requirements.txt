@@ -12,4 +12,9 @@ numpy
 scikit-learn
 PyMuPDF
 pdfplumber
+itsdangerous
 python-docx
+passlib[bcrypt]
+python-jose[cryptography]
+authlib
+pydantic[email]

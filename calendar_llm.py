@@ -4,24 +4,43 @@ import datetime as dt
 import json
 import os
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import Application, Candidate, Job, Profile, RecruiterGoogle, Slot
+
+
+DEFAULT_TIMEZONE = os.getenv("RECRUITER_TIMEZONE", "Europe/Moscow")
+WORKDAY_START_HOUR = int(os.getenv("INTERVIEW_START_HOUR", "8"))
+WORKDAY_END_HOUR = int(os.getenv("INTERVIEW_END_HOUR", "17"))
+INTERVIEW_SLOT_MINUTES = int(os.getenv("INTERVIEW_SLOT_MINUTES", "30"))
+INTERVIEW_DAYS_AHEAD = int(os.getenv("INTERVIEW_DAYS_AHEAD", "3"))
+MAX_SLOTS = int(os.getenv("INTERVIEW_MAX_SLOTS", "24"))
+
+
+def _tz() -> ZoneInfo:
+    return ZoneInfo(DEFAULT_TIMEZONE)
 
 
 def _utcnow_naive() -> dt.datetime:
     return dt.datetime.utcnow().replace(tzinfo=None)
 
 
+def _now_local() -> dt.datetime:
+    return dt.datetime.now(_tz())
+
+
 def _parse_dt(value: Any) -> Optional[dt.datetime]:
     if value is None:
         return None
     if isinstance(value, dt.datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(dt.timezone.utc).replace(tzinfo=None)
         return value.replace(tzinfo=None)
     if isinstance(value, str):
         s = value.strip().replace("Z", "+00:00")
@@ -35,8 +54,44 @@ def _parse_dt(value: Any) -> Optional[dt.datetime]:
     return None
 
 
+def _to_local(utc_naive: dt.datetime) -> dt.datetime:
+    return utc_naive.replace(tzinfo=dt.timezone.utc).astimezone(_tz())
+
+
+def _local_to_utc_naive(local_dt: dt.datetime) -> dt.datetime:
+    if local_dt.tzinfo is None:
+        local_dt = local_dt.replace(tzinfo=_tz())
+    return local_dt.astimezone(dt.timezone.utc).replace(tzinfo=None)
+
+
 def _iso_z(value: dt.datetime) -> str:
     return value.replace(microsecond=0).isoformat() + "Z"
+
+
+def _slot_label(start_utc: dt.datetime, end_utc: dt.datetime) -> str:
+    start_local = _to_local(start_utc)
+    end_local = _to_local(end_utc)
+    return f"{start_local.strftime('%d.%m.%Y %H:%M')} - {end_local.strftime('%H:%M')}"
+
+
+def _next_business_days(count: int = INTERVIEW_DAYS_AHEAD) -> List[dt.date]:
+    days: List[dt.date] = []
+    cursor = _now_local().date()
+    while len(days) < count:
+        cursor += dt.timedelta(days=1)
+        if cursor.weekday() < 5:
+            days.append(cursor)
+    return days
+
+
+def _day_bounds_utc(day: dt.date) -> Tuple[dt.datetime, dt.datetime]:
+    start_local = dt.datetime.combine(day, dt.time(hour=WORKDAY_START_HOUR, minute=0), tzinfo=_tz())
+    end_local = dt.datetime.combine(day, dt.time(hour=WORKDAY_END_HOUR, minute=0), tzinfo=_tz())
+    return _local_to_utc_naive(start_local), _local_to_utc_naive(end_local)
+
+
+def _ranges_overlap(start_a: dt.datetime, end_a: dt.datetime, start_b: dt.datetime, end_b: dt.datetime) -> bool:
+    return start_a < end_b and start_b < end_a
 
 
 async def _get_recruiter_google(db: AsyncSession, recruiter_id: str) -> Optional[RecruiterGoogle]:
@@ -67,7 +122,7 @@ async def _ollama_generate(prompt: str, system: str = "") -> str:
 
 async def get_google_oauth_url(db: AsyncSession, recruiter_id: str) -> str:
     client_id = os.getenv("GOOGLE_CLIENT_ID", "demo-google-client-id")
-    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "http://127.0.0.1:8000/api/google/callback")
+    redirect_uri = os.getenv("GOOGLE_CALENDAR_REDIRECT_URI", "http://127.0.0.1:8000/api/google/callback")
     scope = os.getenv(
         "GOOGLE_SCOPES",
         "https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/calendar.events",
@@ -148,7 +203,7 @@ async def handle_google_callback(db: AsyncSession, recruiter_id: str, code: str)
         "code": code,
         "client_id": os.getenv("GOOGLE_CLIENT_ID"),
         "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
-        "redirect_uri": os.getenv("GOOGLE_REDIRECT_URI", "http://127.0.0.1:8000/api/google/callback"),
+        "redirect_uri": os.getenv("GOOGLE_CALENDAR_REDIRECT_URI", "http://127.0.0.1:8000/api/google/callback"),
         "grant_type": "authorization_code",
     }
     async with httpx.AsyncClient(timeout=60) as client:
@@ -172,12 +227,13 @@ async def handle_google_callback(db: AsyncSession, recruiter_id: str, code: str)
 async def get_google_status(db: AsyncSession, recruiter_id: str) -> Dict[str, Any]:
     google_row = await _get_recruiter_google(db, recruiter_id)
     if not google_row:
-        return {"connected": False, "mode": "none"}
+        return {"connected": False, "mode": "none", "expires_at": None, "calendar_timezone": DEFAULT_TIMEZONE}
     mode = "google" if os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET") else "demo"
     return {
         "connected": bool(google_row.access_token),
         "mode": mode,
         "expires_at": _iso_z(google_row.token_expiry) if google_row.token_expiry else None,
+        "calendar_timezone": DEFAULT_TIMEZONE,
     }
 
 
@@ -187,14 +243,13 @@ async def get_freebusy(db: AsyncSession, recruiter_id: str, time_min: str, time_
     token = await _get_valid_access_token(db, recruiter_id)
 
     if not token or os.getenv("GOOGLE_CLIENT_ID") is None:
-        windows: List[Dict[str, Any]] = []
-        cursor = start.replace(hour=10, minute=0, second=0, microsecond=0)
-        for _ in range(5):
-            if cursor >= end:
-                break
-            windows.append({"start": _iso_z(cursor), "end": _iso_z(cursor + dt.timedelta(hours=2))})
-            cursor = (cursor + dt.timedelta(days=1)).replace(hour=14, minute=0, second=0, microsecond=0)
-        return windows
+        busy: List[Dict[str, Any]] = []
+        for day in _next_business_days(INTERVIEW_DAYS_AHEAD):
+            lunch_start = _local_to_utc_naive(dt.datetime.combine(day, dt.time(hour=12, minute=0), tzinfo=_tz()))
+            lunch_end = _local_to_utc_naive(dt.datetime.combine(day, dt.time(hour=13, minute=0), tzinfo=_tz()))
+            if lunch_end > start and lunch_start < end:
+                busy.append({"start": _iso_z(max(lunch_start, start)), "end": _iso_z(min(lunch_end, end))})
+        return busy
 
     body = {"timeMin": _iso_z(start), "timeMax": _iso_z(end), "items": [{"id": "primary"}]}
     headers = {"Authorization": f"Bearer {token}"}
@@ -203,46 +258,48 @@ async def get_freebusy(db: AsyncSession, recruiter_id: str, time_min: str, time_
         response.raise_for_status()
         data = response.json()
 
-    busy = data.get("calendars", {}).get("primary", {}).get("busy", [])
-    busy_ranges = [(_parse_dt(x.get("start")), _parse_dt(x.get("end"))) for x in busy]
-    busy_ranges = [(a, b) for a, b in busy_ranges if a and b]
-    busy_ranges.sort(key=lambda pair: pair[0])
-
-    windows: List[Dict[str, Any]] = []
-    cursor = start
-    for busy_start, busy_end in busy_ranges:
-        if cursor < busy_start:
-            windows.append({"start": _iso_z(cursor), "end": _iso_z(busy_start)})
-        if busy_end > cursor:
-            cursor = busy_end
-    if cursor < end:
-        windows.append({"start": _iso_z(cursor), "end": _iso_z(end)})
-    return windows
+    return data.get("calendars", {}).get("primary", {}).get("busy", [])
 
 
-async def build_candidate_slots(free_windows: List[Dict[str, Any]], slot_minutes: int = 30, max_slots: int = 8) -> List[Dict[str, Any]]:
+async def _build_candidate_slots_for_days(
+    busy_ranges: List[Tuple[dt.datetime, dt.datetime]],
+    days: List[dt.date],
+    booked_ranges: List[Tuple[dt.datetime, dt.datetime]],
+) -> List[Dict[str, Any]]:
+    slot_delta = dt.timedelta(minutes=INTERVIEW_SLOT_MINUTES)
+    now_utc = _utcnow_naive()
     result: List[Dict[str, Any]] = []
-    delta = dt.timedelta(minutes=slot_minutes)
-    for window in free_windows:
-        start = _parse_dt(window.get("start"))
-        end = _parse_dt(window.get("end"))
-        if not start or not end or end <= start:
-            continue
-        cursor = start
-        while cursor + delta <= end and len(result) < max_slots:
+    blocked = busy_ranges + booked_ranges
+
+    for day in days:
+        day_start_utc, day_end_utc = _day_bounds_utc(day)
+        cursor = day_start_utc
+        while cursor + slot_delta <= day_end_utc:
             slot_start = cursor
-            slot_end = cursor + delta
+            slot_end = cursor + slot_delta
+            cursor = slot_end
+
+            if slot_start <= now_utc:
+                continue
+
+            overlaps = any(
+                _ranges_overlap(slot_start, slot_end, block_start, block_end)
+                for block_start, block_end in blocked
+            )
+            if overlaps:
+                continue
+
             result.append(
                 {
                     "slot_id": str(uuid.uuid4()),
                     "start_dt": _iso_z(slot_start),
                     "end_dt": _iso_z(slot_end),
-                    "label": slot_start.strftime("%d.%m %H:%M") + " UTC",
+                    "label": _slot_label(slot_start, slot_end),
                 }
             )
-            cursor = slot_end
-        if len(result) >= max_slots:
-            break
+            if len(result) >= MAX_SLOTS:
+                return result
+
     return result
 
 
@@ -257,11 +314,13 @@ async def create_calendar_event(db: AsyncSession, recruiter_id: str, start_dt: s
         return {"event_id": f"demo-event-{uuid.uuid4()}", "start_dt": _iso_z(start), "end_dt": _iso_z(end)}
 
     headers = {"Authorization": f"Bearer {token}"}
+    start_local = _to_local(start)
+    end_local = _to_local(end)
     body = {
-        "summary": f"Interview with {candidate_name}",
+        "summary": f"Интервью с кандидатом {candidate_name}",
         "description": description,
-        "start": {"dateTime": _iso_z(start), "timeZone": "UTC"},
-        "end": {"dateTime": _iso_z(end), "timeZone": "UTC"},
+        "start": {"dateTime": start_local.isoformat(), "timeZone": DEFAULT_TIMEZONE},
+        "end": {"dateTime": end_local.isoformat(), "timeZone": DEFAULT_TIMEZONE},
     }
     async with httpx.AsyncClient(timeout=60) as client:
         response = await client.post(
@@ -281,7 +340,11 @@ async def list_job_slots(db: AsyncSession, job_id: str, recruiter_id: str) -> Li
     if not job:
         raise ValueError("job not found")
 
-    result = await db.execute(select(Slot).where(Slot.job_id == job_id).order_by(Slot.start_dt.asc()))
+    result = await db.execute(
+        select(Slot)
+        .where(Slot.job_id == job_id, Slot.recruiter_id == recruiter_id)
+        .order_by(Slot.start_dt.asc())
+    )
     slots = result.scalars().all()
     return [
         {
@@ -297,15 +360,52 @@ async def list_job_slots(db: AsyncSession, job_id: str, recruiter_id: str) -> Li
 
 
 async def get_available_slots(db: AsyncSession, job_id: str, recruiter_id: str) -> List[Dict[str, Any]]:
-    existing = await list_job_slots(db, job_id, recruiter_id)
-    free_existing = [s for s in existing if s.get("status") == "FREE" and s.get("start_dt")]
-    if free_existing:
-        return free_existing
+    job_result = await db.execute(select(Job).where(Job.id == job_id, Job.recruiter_id == recruiter_id))
+    job = job_result.scalar_one_or_none()
+    if not job:
+        raise ValueError("job not found")
 
-    now = _utcnow_naive()
-    windows = await get_freebusy(db, recruiter_id, _iso_z(now), _iso_z(now + dt.timedelta(days=7)))
-    slots = await build_candidate_slots(windows)
+    target_days = _next_business_days(INTERVIEW_DAYS_AHEAD)
+    if not target_days:
+        return []
 
+    range_start = _day_bounds_utc(target_days[0])[0]
+    range_end = _day_bounds_utc(target_days[-1])[1]
+
+    busy_payload = await get_freebusy(db, recruiter_id, _iso_z(range_start), _iso_z(range_end))
+    busy_ranges: List[Tuple[dt.datetime, dt.datetime]] = []
+    for item in busy_payload:
+        start = _parse_dt(item.get("start"))
+        end = _parse_dt(item.get("end"))
+        if start and end and end > start:
+            busy_ranges.append((start, end))
+
+    booked_result = await db.execute(
+        select(Slot).where(
+            Slot.recruiter_id == recruiter_id,
+            Slot.status == "BOOKED",
+            Slot.start_dt >= range_start,
+            Slot.end_dt <= range_end,
+        )
+    )
+    booked_slots = booked_result.scalars().all()
+    booked_ranges = [
+        (slot.start_dt, slot.end_dt)
+        for slot in booked_slots
+        if slot.start_dt and slot.end_dt
+    ]
+
+    await db.execute(
+        delete(Slot).where(
+            Slot.job_id == job_id,
+            Slot.recruiter_id == recruiter_id,
+            Slot.status == "FREE",
+            Slot.start_dt >= range_start,
+            Slot.end_dt <= range_end,
+        )
+    )
+
+    slots = await _build_candidate_slots_for_days(busy_ranges, target_days, booked_ranges)
     created: List[Dict[str, Any]] = []
     for item in slots:
         slot = Slot(
@@ -361,7 +461,7 @@ Rationale: {rationale}
     try:
         summary = await _ollama_generate(prompt, system="Ты HR-ассистент. Пишешь очень краткие, точные summary для рекрутера.")
     except Exception:
-        parts = [f"Кандидат: {candidate_name}.", f"Вакансия: {job.title if job else 'Unknown role'}." ]
+        parts = [f"Кандидат: {candidate_name}.", f"Вакансия: {job.title if job else 'Unknown role'}."]
         if score is not None:
             parts.append(f"Текущий score: {score}/100.")
         if rationale:
@@ -376,6 +476,40 @@ Rationale: {rationale}
     return summary
 
 
+def _extract_candidate_strengths(app: Application, profile: Optional[Profile], candidate: Optional[Candidate]) -> List[str]:
+    strengths: List[str] = []
+    profile_json = profile.profile_json if profile and profile.profile_json else {}
+    skills = profile_json.get("skills") or []
+    experience = profile_json.get("experience") or profile_json.get("experience_years")
+    education = profile_json.get("education")
+    rationale = app.score_rationale or ""
+    screening = app.screening_answers_json or {}
+
+    if isinstance(skills, list):
+        clean_skills = [str(x).strip() for x in skills if str(x).strip()]
+        if clean_skills:
+            strengths.append("навыки: " + ", ".join(clean_skills[:3]))
+    if experience:
+        strengths.append(f"опыт: {experience}")
+    if education:
+        strengths.append(f"образование: {education}")
+    if screening.get("english_level"):
+        strengths.append(f"английский: {screening['english_level']}")
+    if rationale:
+        strengths.append(rationale.strip())
+    if candidate and candidate.telegram_username:
+        strengths.append(f"кандидат быстро вышел на связь через Telegram @{candidate.telegram_username}")
+
+    seen = set()
+    normalized = []
+    for item in strengths:
+        key = item.lower()
+        if key not in seen:
+            seen.add(key)
+            normalized.append(item)
+    return normalized[:3]
+
+
 async def generate_feedback(db: AsyncSession, application_id: str) -> str:
     result = await db.execute(select(Application).where(Application.id == application_id))
     app = result.scalar_one_or_none()
@@ -386,12 +520,17 @@ async def generate_feedback(db: AsyncSession, application_id: str) -> str:
     job = job_result.scalar_one_or_none()
     candidate_result = await db.execute(select(Candidate).where(Candidate.id == app.candidate_id))
     candidate = candidate_result.scalar_one_or_none()
+    profile_result = await db.execute(select(Profile).where(Profile.candidate_id == app.candidate_id))
+    profile = profile_result.scalar_one_or_none()
 
-    candidate_name = (candidate.full_name or candidate.telegram_username) if candidate else "кандидат"
+    candidate_name = (candidate.full_name or candidate.telegram_username or "кандидат") if candidate else "кандидат"
     score = app.score
-    rationale = app.score_rationale or ""
-    missing = app.missing_requirements_json or []
+    rationale = (app.score_rationale or "").strip()
+    missing = [str(x).strip() for x in (app.missing_requirements_json or []) if str(x).strip()]
     threshold = job.threshold_score if job else None
+    strengths = _extract_candidate_strengths(app, profile, candidate)
+    strengths_text = "; ".join(strengths) if strengths else "есть релевантный опыт и мотивация"
+    missing_text = ", ".join(missing[:3]) if missing else "часть ключевых требований вакансии"
 
     prompt = f"""
 Напиши персонализированный отказ кандидату на русском языке.
@@ -402,27 +541,31 @@ async def generate_feedback(db: AsyncSession, application_id: str) -> str:
 Фактический score: {score}
 Rationale: {rationale}
 Недостающие требования: {json.dumps(missing, ensure_ascii=False)}
+Сильные стороны кандидата: {json.dumps(strengths, ensure_ascii=False)}
 
-Требования:
-- Вежливый и профессиональный тон.
-- 1 короткое приветствие.
-- 1 абзац с честной, но мягкой причиной отказа.
-- 1 абзац с сильными сторонами кандидата.
-- Без обещаний трудоустройства.
-- Без markdown.
+Жёсткие требования к ответу:
+- 3 абзаца без markdown.
+- 1 абзац: короткое уважительное приветствие по имени.
+- 2 абзац: мягко объясни отказ, не называй кандидата слабым, не используй шаблонные скобки и заглушки.
+- 3 абзац: отметь 1-2 реальные сильные стороны кандидата из входных данных.
+- Не обещай оффер или повторное рассмотрение.
+- Не пиши от первого лица множественного числа слишком формально; текст должен звучать естественно.
+- Не более 900 символов.
 """.strip()
 
     try:
-        feedback = await _ollama_generate(prompt, system="Ты HR-ассистент. Пишешь деликатные персонализированные отказы кандидатам.")
+        feedback = await _ollama_generate(prompt, system="Ты HR-ассистент. Пишешь деликатные, конкретные и естественные отказы кандидатам без шаблонных заглушек.")
     except Exception:
-        missing_text = ", ".join(map(str, missing)) if missing else "часть требований вакансии"
+        role_title = job.title if job else "выбранную вакансию"
+        score_text = f"По итогам первичной оценки ваш результат составил {score} при пороге {threshold}. " if score is not None and threshold is not None else "На текущем этапе мы не можем продолжить процесс. "
+        rationale_text = f"Сейчас для этой роли особенно важны {missing_text}. " if missing_text else ""
         feedback = (
-            f"Спасибо, {candidate_name}, за интерес к вакансии {job.title if job else 'Unknown role'}. "
-            f"На текущем этапе мы не готовы продолжить процесс: текущий score составляет {score if score is not None else 'N/A'}, "
-            f"а для роли сейчас особенно важны следующие требования: {missing_text}. "
-            f"При этом мы отмечаем сильные стороны вашего профиля и благодарим за уделённое время."
+            f"Здравствуйте, {candidate_name}! Спасибо за интерес к вакансии {role_title}.\n\n"
+            f"{score_text}{rationale_text}Поэтому сейчас мы не готовы пригласить вас на следующий этап отбора.\n\n"
+            f"При этом мы отметили ваши сильные стороны: {strengths_text}. Спасибо за время и внимание к нашей вакансии."
         )
 
+    feedback = "\n\n".join(part.strip() for part in feedback.split("\n\n") if part.strip())
     app.feedback_text = feedback
     app.status = "REJECTED"
     app.updated_at = _utcnow_naive()

@@ -1,25 +1,69 @@
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <title>Интеграции</title>
-    <link rel="stylesheet" href="/static/style.css">
-</head>
-<body>
-    <main class="container">
-        <h1>Интеграции</h1>
+{% extends "base.html" %}
 
-        <p>Здесь можно подключить Google Calendar для автоматического назначения интервью.</p>
+{% block content %}
+<div style="max-width: 760px; margin: 0 auto;">
+    <h1><i class="fab fa-google"></i> Интеграция с Google Calendar</h1>
+    <p>Подключите календарь, чтобы система могла показывать кандидату только свободные интервалы и автоматически создавать событие после подтверждения интервью.</p>
 
-        <div style="margin-top: 20px;">
-            <a href="/google/connect">
-                <button>Подключить Google Calendar</button>
-            </a>
+    <div class="card" style="padding: 1.5rem; margin-top: 1.5rem;">
+        <h2 style="margin-top: 0;">Статус подключения</h2>
+        <p id="googleStatusText">Проверяю состояние подключения...</p>
+        <p id="googleStatusMeta" style="color: var(--pikmi-mauve);"></p>
+        <div style="display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 1rem;">
+            <button id="connectGoogleBtn" class="btn btn-lg">
+                <i class="fab fa-google"></i> Подключить / переподключить Google Calendar
+            </button>
+            <a href="/jobs" class="btn btn-warning btn-lg">Вернуться к вакансиям</a>
         </div>
+    </div>
 
-        <div style="margin-top: 20px;">
-            <a href="/jobs">Назад к вакансиям</a>
-        </div>
-    </main>
-</body>
-</html>
+    <div class="card" style="padding: 1.5rem; margin-top: 1.5rem;">
+        <h2 style="margin-top: 0;">Как это работает</h2>
+        <ul>
+            <li>кандидату предлагаются только свободные слоты;</li>
+            <li>слоты строятся на 3 ближайших рабочих дня;</li>
+            <li>интервалы идут по 30 минут с 08:00 до 17:00;</li>
+            <li>после выбора создаётся событие в Google Calendar.</li>
+        </ul>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadGoogleStatus() {
+    try {
+        const response = await apiFetch('/api/google/status', { method: 'GET', headers: {} });
+        if (!response || !response.ok) {
+            throw new Error('Не удалось получить статус подключения');
+        }
+        const data = await response.json();
+        const statusText = document.getElementById('googleStatusText');
+        const statusMeta = document.getElementById('googleStatusMeta');
+
+        if (data.connected) {
+            statusText.textContent = 'Google Calendar подключён.';
+            statusMeta.textContent = `Режим: ${data.mode}. Часовой пояс календаря: ${data.calendar_timezone}.`;
+        } else {
+            statusText.textContent = 'Google Calendar ещё не подключён.';
+            statusMeta.textContent = `После подключения вы будете возвращены обратно в интерфейс. Часовой пояс: ${data.calendar_timezone}.`;
+        }
+    } catch (error) {
+        document.getElementById('googleStatusText').textContent = 'Не удалось проверить статус подключения.';
+        document.getElementById('googleStatusMeta').textContent = String(error);
+    }
+}
+
+document.getElementById('connectGoogleBtn').addEventListener('click', async () => {
+    const recruiterId = localStorage.getItem('recruiter_id');
+    if (!recruiterId) {
+        alert('Сначала войдите в систему как рекрутер.');
+        window.location.href = '/';
+        return;
+    }
+    window.location.href = `/google/connect?recruiter_id=${encodeURIComponent(recruiterId)}`;
+});
+
+loadGoogleStatus();
+</script>
+{% endblock %}
